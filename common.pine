@@ -1,0 +1,523 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Howitzah
+
+//@version=6
+
+// @description TODO: add library description here
+library("common", overlay = true)
+import TradingView/ta/10
+
+// @function TODO: add function description here
+// @param x TODO: add parameter x description here
+// @returns TODO: add what function returns
+export IsLong() => strategy.position_size > 0
+export IsShort() => strategy.position_size < 0
+
+ // Determine if LDPM crossed a level in the last X bars
+export LDPMCrossedInLastX(float level, string dir, int numBars, series float ldpm89KF) => 
+    bool ldpmCrossed = false
+    for i = 1 to numBars
+        if (dir == "up" and ldpm89KF[i] <= level)
+            ldpmCrossed := true
+        else if (dir == "down" and ldpm89KF[i] >= level)
+            ldpmCrossed := true
+    ldpmCrossed
+
+export InSession(string sessionTime, string sessionTimeZone=syminfo.timezone) => not na(time(timeframe.period, sessionTime, sessionTimeZone))
+
+// Determine if price touched or crossed a certain level in the last x bars
+export PriceTouchedInLastX(float level, int numBars) =>
+    bool priceCrossed = false
+    for i = 1 to numBars
+        if (low[i] <= level and high[i] >= level)
+            priceCrossed := true
+            break
+    priceCrossed
+
+export curProfitInPts() =>
+    if strategy.position_size > 0
+        (close - strategy.position_avg_price)
+    else if strategy.position_size < 0
+        (strategy.position_avg_price - close)
+    else
+        0
+
+export debugLabel(float price, string txt) =>
+    label.new(
+         bar_index, price, text = txt, color = color.teal, textcolor = color.white, 
+         style = label.style_label_lower_right, size = size.large
+     )
+    line.new(
+         bar_index, price, bar_index + 1, price, color = color.teal, extend = extend.right, 
+         style = line.style_dashed
+     )
+
+export linRegSlope(series float src, int length) =>
+    lrc = ta.linreg(src, length, 0)
+    lrc1 = ta.linreg(src,length,1)
+    lrs = (lrc-lrc1)
+    lrs
+
+// Function to parse time string to minutes since midnight
+export timeToMinutes(string timeStr) =>
+    parts = str.split(timeStr, ":")
+    if array.size(parts) == 2
+        hours = str.tonumber(array.get(parts, 0))
+        minutes = str.tonumber(array.get(parts, 1))
+        result = hours * 60 + minutes
+        result
+    else
+        na
+
+// Function to check if current time is in banned list
+export isTimeBanned(string bannedTimesStr, bool enableTimeFilter) =>
+    banned = false
+    if enableTimeFilter and str.length(bannedTimesStr) > 0
+        // Get current bar time
+        currentHour = hour(time)
+        currentMinute = minute(time)
+        currentTimeMinutes = currentHour * 60 + currentMinute
+        
+        // Round down to nearest 30-minute interval
+        intervalMinutes = math.floor(currentTimeMinutes / 30) * 30
+        intervalHour = math.floor(intervalMinutes / 60)
+        intervalMinute = intervalMinutes % 60
+        currentInterval = str.format("{0}:{1}", 
+             intervalHour < 10 ? "0" + str.tostring(intervalHour) : str.tostring(intervalHour),
+             intervalMinute < 10 ? "0" + str.tostring(intervalMinute) : str.tostring(intervalMinute))
+        
+        // Split the banned times string
+        bannedList = str.split(bannedTimesStr, ",")
+        
+        // Check each banned time
+        for i = 0 to array.size(bannedList) - 1
+            bannedTime = str.trim(array.get(bannedList, i))
+            if currentInterval == bannedTime
+                banned := true
+                break
+    banned
+
+// @description Calculates the maximum runup in points for the current position
+// @param entryPrice The entry price of the position (optional - will use strategy.position_avg_price if not provided)
+// @returns The maximum runup in points (positive value for profitable moves)
+export getMaxRunup(float entryPrice = na) =>
+    float ep = na(entryPrice) ? strategy.position_avg_price : entryPrice
+    float maxRunup = 0.0
+    
+    if strategy.position_size != 0 and not na(ep)
+        if strategy.position_size > 0  // Long position
+            // For longs, track the highest high since entry
+            maxRunup := high - ep
+        else  // Short position
+            // For shorts, track the lowest low since entry (inverted for positive runup)
+            maxRunup := ep - low
+    
+    math.max(maxRunup, 0)
+
+export canTradeCurrentProfit(float dailyNetProfitLimit)=>
+    var bool canTrade = false
+    tD = time("D")
+    var float dailyProfitStart = na
+    if tD!=tD[1] or na(dailyProfitStart) // new day or start
+        dailyProfitStart := strategy.netprofit
+        canTrade := true
+    if strategy.netprofit - dailyProfitStart >= dailyNetProfitLimit
+        canTrade := false
+    canTrade
+
+// --- Function to check for new periods ---
+export isNewPeriod(string res) =>
+    t = time(res)
+    na(t[1]) or t > t[1]
+
+// Function to validate if the entry distance from critical level is sufficient
+// @param levels - array of float values representing the price levels tested
+// @param direction - string "long" or "short" representing the trade direction
+// @param minDistancePoints - the minimum required distance in points
+// @returns boolean - true if distance is sufficient, false otherwise
+export isEntryDistanceSufficient(float[] levels, string direction, float minDistancePoints) =>
+    // Return true if no levels are present (though this shouldn't happen in normal operation)
+    if array.size(levels) == 0
+        true
+    else
+        // Find the critical level (highest for longs, lowest for shorts)
+        float criticalLevel = direction == "long" ? 
+             array.max(levels) :  // Highest level for longs
+             array.min(levels)    // Lowest level for shorts
+        
+        // Calculate distance from close to critical level
+        float distancePoints = direction == "long" ?
+             (close - criticalLevel) :  // For longs: close should be above critical level
+             (criticalLevel - close)    // For shorts: close should be below critical level
+            
+        // Convert to ticks if needed (1 point = 4 ticks)
+        float distanceTicks = distancePoints * 4
+        
+        // Return true if distance meets or exceeds minimum requirement
+        distancePoints >= minDistancePoints
+
+
+// Function to check if the current bar time is within optimal trading hours
+// @returns boolean - true if within optimal hours (excluding the last bar before period ends), false otherwise
+export isOptimalTradingHour(int startOptimalHour, int endOptimalHour, int timeZoneOffset) =>
+    // Get current bar's hour and minute, adjusted for time zone
+    int currentHour = hour(time) + timeZoneOffset
+    int currentMinute = minute(time)
+    
+    // Get chart timeframe in minutes
+    int timeframeMinutes = timeframe.multiplier
+    
+    // Normalize hour to 0-23 range if needed
+    if currentHour > 23
+        currentHour := currentHour - 24
+    if currentHour < 0
+        currentHour := currentHour + 24
+        
+    // Convert current time to total minutes from midnight
+    int currentTotalMinutes = currentHour * 60 + currentMinute
+    
+    // Convert optimal hours to total minutes from midnight
+    int startOptimalMinutes = startOptimalHour * 60
+    int endOptimalMinutes = endOptimalHour * 60
+    
+    // Calculate the time one bar before the optimal period ends
+    int preEndMinutes = endOptimalMinutes - timeframeMinutes
+    if preEndMinutes < 0
+        preEndMinutes := preEndMinutes + 1440  // Add 24 hours in minutes
+    
+    // Check if current time is within optimal hours (but not the last bar)
+    bool isOptimal = false
+    
+    // If start hour is less than end hour, it's a simple range check
+    if startOptimalHour < endOptimalHour
+        isOptimal := currentTotalMinutes >= startOptimalMinutes and currentTotalMinutes <= preEndMinutes
+    // If start hour is greater than end hour, it spans across midnight
+    else
+        isOptimal := (currentTotalMinutes >= startOptimalMinutes) or (currentTotalMinutes <= preEndMinutes)
+    
+    isOptimal
+
+// Function to check if the current bar time is within hours to avoid
+// @returns boolean - true if within hours to avoid OR the bar before avoid period, false otherwise
+export isHourToAvoid(int startAvoidHour, int endAvoidHour, int timeZoneOffset) =>
+    // Get current bar's hour and minute, adjusted for time zone
+    int currentHour = hour(time) + timeZoneOffset
+    int currentMinute = minute(time)
+    
+    // Get chart timeframe in minutes
+    int timeframeMinutes = timeframe.multiplier
+    
+    // Normalize hour to 0-23 range if needed
+    if currentHour > 23
+        currentHour := currentHour - 24
+    if currentHour < 0
+        currentHour := currentHour + 24
+        
+    // Convert current time to total minutes from midnight
+    int currentTotalMinutes = currentHour * 60 + currentMinute
+    
+    // Apply timezone offset to avoid hours as well to keep everything in same timezone
+    int adjustedStartAvoidHour = startAvoidHour + timeZoneOffset
+    int adjustedEndAvoidHour = endAvoidHour + timeZoneOffset
+    
+    // Normalize adjusted hours
+    if adjustedStartAvoidHour > 23
+        adjustedStartAvoidHour := adjustedStartAvoidHour - 24
+    if adjustedStartAvoidHour < 0
+        adjustedStartAvoidHour := adjustedStartAvoidHour + 24
+    if adjustedEndAvoidHour > 23
+        adjustedEndAvoidHour := adjustedEndAvoidHour - 24
+    if adjustedEndAvoidHour < 0
+        adjustedEndAvoidHour := adjustedEndAvoidHour + 24
+    
+    // Convert adjusted avoid hours to total minutes from midnight
+    int startAvoidMinutes = adjustedStartAvoidHour * 60
+    int endAvoidMinutes = adjustedEndAvoidHour * 60
+    
+    // Check if in main avoid period
+    bool inAvoidPeriod = false
+    if adjustedStartAvoidHour < adjustedEndAvoidHour
+        inAvoidPeriod := currentTotalMinutes >= startAvoidMinutes and currentTotalMinutes <= endAvoidMinutes
+    else
+        inAvoidPeriod := currentTotalMinutes >= startAvoidMinutes or currentTotalMinutes <= endAvoidMinutes
+    
+    // Check if this is the pre-avoid bar
+    int preAvoidBarStartMinutes = startAvoidMinutes - timeframeMinutes
+    bool isPreAvoidBar = false
+    
+    if preAvoidBarStartMinutes >= 0
+        isPreAvoidBar := currentTotalMinutes >= preAvoidBarStartMinutes and currentTotalMinutes < startAvoidMinutes
+    else
+        int adjustedPreAvoidStart = preAvoidBarStartMinutes + 1440
+        isPreAvoidBar := currentTotalMinutes >= adjustedPreAvoidStart
+    
+    bool shouldAvoid = inAvoidPeriod or isPreAvoidBar
+    shouldAvoid
+
+// Function to determine the trading quality based on the current hour
+// @returns string - "optimal", "avoid", or "neutral"
+export getTradingHourQuality(int startOptimalHour, int endOptimalHour, int startAvoidHour, int endAvoidHour, int timeZoneOffset) =>
+    if isOptimalTradingHour(startOptimalHour, endOptimalHour, timeZoneOffset)
+        "optimal"
+    else if isHourToAvoid(startAvoidHour, endAvoidHour, timeZoneOffset)
+        "avoid"
+    else
+        "neutral"
+
+// Function to get a recommended position size multiplier based on time
+// @param baseSize - the base position size (e.g., 1 contract)
+// @param optimalMultiplier - multiplier for optimal hours (e.g., 1.5 for 150%)
+// @param neutralMultiplier - multiplier for neutral hours (e.g., 0.5 for 50%)
+// @param avoidMultiplier - multiplier for hours to avoid (e.g., 0 to skip trading)
+// @returns float - the recommended position size
+export getTimedPositionSize(float baseSize, float optimalMultiplier, float neutralMultiplier, float avoidMultiplier, int startOptimalHour, int endOptimalHour, int startAvoidHour, int endAvoidHour, int timeZoneOffset) =>
+    string quality = getTradingHourQuality(startOptimalHour, endOptimalHour, startAvoidHour, endAvoidHour, timeZoneOffset)
+    float sizeMultiplier = 0.0
+    
+    if quality == "optimal"
+        sizeMultiplier := optimalMultiplier
+    else if quality == "neutral"
+        sizeMultiplier := neutralMultiplier
+    else // "avoid"
+        sizeMultiplier := avoidMultiplier
+        
+    baseSize * sizeMultiplier
+
+// @function Checks if a set of levels matches any blacklisted combination
+// @param levels An array of strings representing the levels in the current signal
+// @param blacklistMatrix A matrix where each row represents a blacklisted combination
+// @returns true if the levels match any blacklisted combination, false otherwise
+export isBlacklisted(string[] levels, matrix<string> blacklistMatrix) =>
+    // Return false for empty inputs
+    if array.size(levels) == 0 or matrix.rows(blacklistMatrix) == 0
+        false
+    else
+        // Sort levels for consistent comparison regardless of order
+        string[] sortedLevels = array.copy(levels)
+        array.sort(sortedLevels)
+        
+        // Check against each blacklisted combination
+        bool isMatch = false
+        
+        for i = 0 to matrix.rows(blacklistMatrix) - 1
+            // Get current blacklisted combination as array and filter out empty strings
+            string[] rawBlacklistCombo = matrix.row(blacklistMatrix, i)
+            string[] blacklistCombo = array.new<string>()
+
+            // Only add non-empty strings
+            for k = 0 to array.size(rawBlacklistCombo) - 1
+                string level = array.get(rawBlacklistCombo, k)
+                if str.length(level) > 0
+                    array.push(blacklistCombo, level)
+
+            // Skip if lengths don't match after filtering
+            if array.size(blacklistCombo) != array.size(sortedLevels)
+                continue
+                
+            // Sort the blacklist combination for consistent comparison
+            string[] sortedBlacklist = array.copy(blacklistCombo)
+            array.sort(sortedBlacklist)
+            
+            // Check if sorted arrays match
+            bool allMatch = true
+            
+            for j = 0 to array.size(sortedLevels) - 1
+                if array.get(sortedLevels, j) != array.get(sortedBlacklist, j)
+                    allMatch := false
+                    break
+            
+            // If all elements match, we found a blacklisted combination
+            if allMatch
+                isMatch := true
+                break
+        
+        isMatch
+
+// @function Converts a string blacklist to a matrix where each row is a blacklisted level combination
+// @param blacklistStr A string with format "L1, L2; L3, L4, L5; ..." where levels are comma-separated and combinations are semicolon-separated
+// @returns A matrix where each row is a level combination and columns are levels
+export ParseBlacklistString(string blacklistStr) =>
+    // Start with an empty result
+    matrix<string> result = matrix.new<string>()
+    
+    // Process only if we have input
+    if str.length(blacklistStr) > 0
+        // Split by semicolons to get combinations
+        string[] combinations = str.split(blacklistStr, ";")
+        
+        // First pass: Find the maximum number of levels
+        int maxLevels = 0
+        int validCombos = 0
+        
+        for i = 0 to array.size(combinations) - 1
+            string comboStr = array.get(combinations, i)
+            
+            if str.length(str.trim(comboStr)) > 0
+                string[] levels = str.split(comboStr, ",")
+                int validLevels = 0
+                
+                for j = 0 to array.size(levels) - 1
+                    if str.length(str.trim(array.get(levels, j))) > 0
+                        validLevels += 1
+                
+                if validLevels > 0
+                    validCombos += 1
+                    maxLevels := math.max(maxLevels, validLevels)
+        
+        // Create the matrix with the right dimensions
+        if validCombos > 0 and maxLevels > 0
+            result := matrix.new<string>(validCombos, maxLevels, "")
+            
+            // Second pass: Fill the matrix
+            int rowIndex = 0
+            
+            for i = 0 to array.size(combinations) - 1
+                string comboStr = array.get(combinations, i)
+                
+                if str.length(str.trim(comboStr)) > 0
+                    string[] rawLevels = str.split(comboStr, ",")
+                    int colIndex = 0
+                    
+                    for j = 0 to array.size(rawLevels) - 1
+                        string level = str.trim(array.get(rawLevels, j))
+                        
+                        if str.length(level) > 0
+                            matrix.set(result, rowIndex, colIndex, level)
+                            colIndex += 1
+                    
+                    // Only increment row if we added at least one level
+                    if colIndex > 0
+                        rowIndex += 1
+    
+    result
+
+// Function to check if array1 has at least one element from array2
+export hasCommonElement(array<string> array1, array<string> array2) =>
+    result = false
+    if array.size(array1) > 0 and array.size(array2) > 0
+        for i = 0 to array.size(array1) - 1
+            element = array.get(array1, i)
+            if array.includes(array2, element)
+                result := true
+                break
+    result
+
+// Function to check if array1 has at least one element NOT in array2
+export hasUniqueElement(array<string> array1, array<string> array2) =>
+    result = false
+    if array.size(array1) > 0
+        for i = 0 to array.size(array1) - 1
+            element = array.get(array1, i)
+            if not array.includes(array2, element)
+                result := true
+                break
+    result
+
+// Function to count unique categories in source array
+export countUniqueCategories(array<string> sourceArray, array<string> cat1=na, array<string> cat2=na, array<string> cat3=na, array<string> cat4=na, array<string> cat5=na, array<string> cat6=na, array<string> cat7=na, array<string> cat8=na, array<string> cat9=na, array<string> cat10=na) =>
+    categoryCount = 0
+    
+    // Check each category array if it's not na
+    if not na(cat1) and hasCommonElement(sourceArray, cat1)
+        categoryCount += 1
+    if not na(cat2) and hasCommonElement(sourceArray, cat2)
+        categoryCount += 1
+    if not na(cat3) and hasCommonElement(sourceArray, cat3)
+        categoryCount += 1
+    if not na(cat4) and hasCommonElement(sourceArray, cat4)
+        categoryCount += 1
+    if not na(cat5) and hasCommonElement(sourceArray, cat5)
+        categoryCount += 1
+    if not na(cat6) and hasCommonElement(sourceArray, cat6)
+        categoryCount += 1
+    if not na(cat7) and hasCommonElement(sourceArray, cat7)
+        categoryCount += 1
+    if not na(cat8) and hasCommonElement(sourceArray, cat8)
+        categoryCount += 1
+    if not na(cat9) and hasCommonElement(sourceArray, cat9)
+        categoryCount += 1
+    if not na(cat10) and hasCommonElement(sourceArray, cat10)
+        categoryCount += 1
+    
+    categoryCount
+
+// Function to convert string array to CSV
+export arrayToCSV(array<string> arr, string delimiter = ",") =>
+    if array.size(arr) == 0
+        ""
+    else
+        result = ""
+        for i = 0 to array.size(arr) - 1
+            element = array.get(arr, i)
+            result := result + (i > 0 ? delimiter : "") + element
+        result
+
+    // Function to convert float array to CSV
+export floatArrayToCSV(array<float> arr, string delimiter = ",") =>
+    if array.size(arr) == 0
+        ""
+    else
+        result = ""
+        for i = 0 to array.size(arr) - 1
+            element = array.get(arr, i)
+            // Convert float to string with specified precision
+            elementStr = str.tostring(element, format.mintick)
+            // Alternative: use specific decimal places
+            // elementStr = str.tostring(element, "#.##")
+            result := result + (i > 0 ? delimiter : "") + elementStr
+        result
+
+// @function Simple daily loss check that closes positions when limit hit
+// @param maxDailyLoss (float) Maximum allowed loss in USD for the day
+// @returns (bool) True if trading is allowed, false if daily loss limit exceeded
+export simpleDailyLossLimit(float maxDailyLoss) =>
+    
+    // Input validation
+    if maxDailyLoss <= 0
+        runtime.error("Daily loss limit must be greater than 0")
+    
+    // Track daily starting equity
+    var float dayStartEquity = na
+    var bool limitHitToday = false
+    
+    // Reset on new day
+    dayChange = ta.change(dayofweek)
+    if dayChange != 0 or na(dayStartEquity)
+        dayStartEquity := strategy.equity - strategy.openprofit  // Start with closed equity
+        limitHitToday := false
+    
+    // Calculate total daily P&L (closed trades + open positions)
+    totalDailyPnL = (strategy.equity - dayStartEquity)
+    
+    // Check if limit is exceeded
+    limitExceeded = totalDailyPnL <= -maxDailyLoss
+    
+    // Close all positions if limit hit and we have open positions
+    if limitExceeded and not limitHitToday and strategy.position_size != 0
+        strategy.close_all(comment="Daily limit hit: $" + str.tostring(math.abs(totalDailyPnL), "#"))
+        limitHitToday := true
+    
+    // Block new trading if limit exceeded
+    if limitExceeded
+        limitHitToday := true
+    
+    // Return whether trading is allowed
+    not limitHitToday
+
+// Function to count support levels below a given price
+export countSupportLevelsBelow(float price, array<float> supportLevels) =>
+    var int count = 0
+    count := 0
+    for i = 0 to array.size(supportLevels) - 1
+        if array.get(supportLevels, i) < price
+            count += 1
+    count
+
+// Function to count resistance levels above a given price
+export countResistanceLevelsAbove(float price, array<float> resistanceLevels) =>
+    var int count = 0
+    count := 0
+    for i = 0 to array.size(resistanceLevels) - 1
+        if array.get(resistanceLevels, i) > price
+            count += 1
+    count

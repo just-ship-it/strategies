@@ -1,0 +1,566 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Howitzah
+
+//@version=6
+strategy("LDPS Trader - Bidirectional", overlay=true)
+import Howitzah/common/8 as c
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// LDPM (Liquidity Dependent Price Movement) Levels
+ldpm_1 = input.source(title="LDPM Level 1", defval=close, group="LDPM Settings")
+ldpm_2 = input.source(title="LDPM Level 2", defval=close, group="LDPM Settings")
+ldpm_3 = input.source(title="LDPM Level 3", defval=close, group="LDPM Settings")
+ldpm_4 = input.source(title="LDPM Level 4", defval=close, group="LDPM Settings")
+ldpm_5 = input.source(title="LDPM Level 5", defval=close, group="LDPM Settings")
+
+// LDPS (Liquidity Dependent Price Stability) Settings
+ldps_is_bullish = input.source(title="LDPS Is Bullish", defval=close, group="LDPS Settings")
+ldps_is_bearish = input.source(title="LDPS Is Bearish", defval=close, group="LDPS Settings")
+min_bullish_ldpm = input.int(title="Minimum Bullish LDPM Levels Required", defval=2, minval=0, maxval=5, group="LDPS Settings", tooltip="Number of LDPM levels that must be below current price (acting as support)")
+min_bearish_ldpm = input.int(title="Minimum Bearish LDPM Levels Required", defval=2, minval=0, maxval=5, group="LDPS Settings", tooltip="Number of LDPM levels that must be above current price (acting as resistance)")
+
+// Position Type Settings
+allow_long = input.bool(title="Allow Long Positions", defval=true, group="Position Settings")
+allow_short = input.bool(title="Allow Short Positions", defval=true, group="Position Settings")
+
+// LDPM Crossing Filter Settings
+use_ldpm_filter = input.bool(true, title="Enable LDPM Crossing Filter", group="LDPM Filter")
+max_ldpm_crossed = input.int(0, title="Max LDPM Levels Crossed by Trigger", minval=0, maxval=5, group="LDPM Filter", tooltip="Maximum number of LDPM levels the trigger candle can cross. 0 = trigger candle must not touch any LDPM levels")
+
+// Basic Strategy Settings
+stop_loss_points = input.int(title="Stop Loss (Points)", defval=50, minval=1, maxval=200, group="Strategy Settings")
+take_profit_points = input.int(title="Take Profit (Points)", defval=100, minval=1, maxval=500, group="Strategy Settings")
+order_valid_bars = input.int(title="Order Valid for X Bars (0 = Until Bearish Flip)", defval=5, minval=0, maxval=50, group="Strategy Settings", tooltip="Number of bars to keep limit order valid. 0 means order remains valid until LDPS flips bearish")
+opposite_bars_required = input.int(title="Opposite Bars Required Before Flip", defval=0, minval=0, maxval=100, group="Strategy Settings", tooltip="Number of consecutive opposite direction bars required before accepting a flip signal. 0 = disabled (no requirement)")
+
+// Trailing Stop Settings
+use_trailing_stop = input.bool(false, title="Enable Trailing Stop", group="Exit Settings")
+trailing_trigger_points = input.float(title="Trailing Stop Trigger (Points)", defval=25.0, minval=0.25, step=0.25, group="Exit Settings")
+trailing_offset_points = input.float(title="Trailing Stop Offset (Points)", defval=10.0, minval=0.25, step=0.25, group="Exit Settings")
+
+// Break-Even Stop Settings
+use_breakeven_stop = input.bool(false, title="Enable Break-Even Stop", group="Exit Settings")
+breakeven_trigger_points = input.float(title="Points Until Break-Even Stop", defval=20.0, minval=0.25, step=0.25, group="Exit Settings", tooltip="Points of profit before moving stop to break-even")
+
+// Second Tier Trailing Stop Settings
+use_second_tier_trailing = input.bool(false, "Enable Second Tier Trailing Stop", group="Second Tier Trailing")
+second_tier_bars = input.int(5, "Bars Before Second Tier Activates", minval=1, maxval=20, group="Second Tier Trailing")
+second_tier_trigger = input.int(5, "Second Tier Trail Trigger (Points)", minval=1, maxval=50, step=1, group="Second Tier Trailing", tooltip="Points in profit before second tier trailing activates")
+second_tier_offset = input.int(10, "Second Tier Trail Offset (Points)", minval=1, maxval=50, step=1, group="Second Tier Trailing", tooltip="Points away from peak for second tier trailing stop")
+
+// Debug Settings
+show_debug_labels = input.bool(title="Show Debug Labels", defval=true, group="Debug Settings")
+
+// Webhook Settings
+webhook_secret = input.string(title="Webhook Secret", defval="You Wish", group="Webhook Settings", tooltip="Secret key for webhook authentication")
+
+// ============================================================================
+// LDPS SIGNAL PROCESSING
+// ============================================================================
+
+// Convert LDPS inputs to boolean values (assuming non-zero values represent true)
+is_bullish = ldps_is_bullish > 0
+is_bearish = ldps_is_bearish > 0
+
+// Detect LDPS flip from bearish to bullish
+ldps_flipped_bullish = is_bullish and is_bearish[1] and not is_bullish[1]
+
+// Detect LDPS flip from bullish to bearish
+ldps_flipped_bearish = is_bearish and is_bullish[1] and not is_bearish[1]
+
+// Track the trigger candle information
+var float trigger_candle_low = na
+var int trigger_bar_index = na
+var int bars_since_trigger = 0
+
+// Track short trigger candle information
+var float short_trigger_candle_high = na
+var int short_trigger_bar_index = na
+var int bars_since_short_trigger = 0
+
+// Track entry information for second tier trailing
+var int entry_bar_index = na
+var bool second_tier_active = false
+
+// Track break-even stop activation
+var bool breakeven_active = false
+var float breakeven_stop_price = na
+
+// Track alert states to avoid duplicate alerts
+var bool long_limit_alert_sent = false
+var bool short_limit_alert_sent = false
+var bool long_cancel_alert_sent = false
+var bool short_cancel_alert_sent = false
+
+// ============================================================================
+// LDPM LEVEL ANALYSIS
+// ============================================================================
+
+// Store LDPM levels in array for easier processing
+ldpm_levels = array.new<float>()
+array.push(ldpm_levels, ldpm_1)
+array.push(ldpm_levels, ldpm_2)
+array.push(ldpm_levels, ldpm_3)
+array.push(ldpm_levels, ldpm_4)
+array.push(ldpm_levels, ldpm_5)
+
+// Count bullish LDPM levels (those below current price acting as support)
+bullish_ldpm_count = 0
+bullish_ldpm_levels = array.new<float>()  // Only levels below price
+
+for i = 0 to array.size(ldpm_levels) - 1
+    level = array.get(ldpm_levels, i)
+    if not na(level) and level < close
+        bullish_ldpm_count += 1
+        array.push(bullish_ldpm_levels, level)
+
+// Count bearish LDPM levels (those above current price acting as resistance)
+bearish_ldpm_count = 0
+bearish_ldpm_levels = array.new<float>()  // Only levels above price
+
+for i = 0 to array.size(ldpm_levels) - 1
+    level = array.get(ldpm_levels, i)
+    if not na(level) and level > close
+        bearish_ldpm_count += 1
+        array.push(bearish_ldpm_levels, level)
+
+// ============================================================================
+// LONG ENTRY CONDITIONS
+// ============================================================================
+
+// Check if we have sufficient bullish LDPM support
+ldpm_requirement_met = bullish_ldpm_count >= min_bullish_ldpm
+
+// Count how many bullish LDPM levels the current candle crosses
+ldpm_crossed_count = 0
+if array.size(bullish_ldpm_levels) > 0
+    for i = 0 to array.size(bullish_ldpm_levels) - 1
+        level = array.get(bullish_ldpm_levels, i)
+        if low <= level and high >= level
+            ldpm_crossed_count += 1
+
+// Check LDPM crossing condition (evaluated on every bar)
+ldpm_filter_passed = not use_ldpm_filter or ldpm_crossed_count <= max_ldpm_crossed
+
+// Check for required opposite (bearish) bars before bullish flip
+opposite_bars_met = true
+if opposite_bars_required > 0
+    opposite_bars_met := true
+    for i = 1 to opposite_bars_required
+        if i <= bar_index and not is_bearish[i]
+            opposite_bars_met := false
+            break
+
+// When LDPS flips bullish and all requirements are met, store trigger candle info
+if ldps_flipped_bullish and ldpm_requirement_met and ldpm_filter_passed and strategy.position_size == 0 and allow_long and opposite_bars_met
+    // Only store new trigger if no existing pending trigger
+    if na(trigger_candle_low)
+        trigger_candle_low := math.min(open, close)  // Base of candle body
+        trigger_bar_index := bar_index
+        bars_since_trigger := 0
+        long_limit_alert_sent := false  // Reset alert flag for new signal
+        long_cancel_alert_sent := false
+
+// Update bars since trigger (always update for active triggers)
+if not na(trigger_candle_low)
+    bars_since_trigger := bar_index - trigger_bar_index
+
+// Cancel order conditions
+bars_exceeded = order_valid_bars > 0 and bars_since_trigger > order_valid_bars
+bearish_flip_cancel = ldps_flipped_bearish and strategy.position_size == 0
+
+// ============================================================================
+// SHORT ENTRY CONDITIONS
+// ============================================================================
+
+// Check if we have sufficient bearish LDPM resistance
+bearish_ldpm_requirement_met = bearish_ldpm_count >= min_bearish_ldpm
+
+// Count how many bearish LDPM levels the current candle crosses
+bearish_ldpm_crossed_count = 0
+if array.size(bearish_ldpm_levels) > 0
+    for i = 0 to array.size(bearish_ldpm_levels) - 1
+        level = array.get(bearish_ldpm_levels, i)
+        if low <= level and high >= level
+            bearish_ldpm_crossed_count += 1
+
+// Check LDPM crossing condition for shorts (evaluated on every bar)
+bearish_ldpm_filter_passed = not use_ldpm_filter or bearish_ldpm_crossed_count <= max_ldpm_crossed
+
+// Check for required opposite (bullish) bars before bearish flip
+opposite_bars_met_short = true
+if opposite_bars_required > 0
+    opposite_bars_met_short := true
+    for i = 1 to opposite_bars_required
+        if i <= bar_index and not is_bullish[i]
+            opposite_bars_met_short := false
+            break
+
+// When LDPS flips bearish and all requirements are met, store short trigger candle info
+if ldps_flipped_bearish and bearish_ldpm_requirement_met and bearish_ldpm_filter_passed and strategy.position_size == 0 and allow_short and opposite_bars_met_short
+    // Only store new trigger if no existing pending trigger
+    if na(short_trigger_candle_high)
+        short_trigger_candle_high := math.max(open, close)  // Top of candle body
+        short_trigger_bar_index := bar_index
+        bars_since_short_trigger := 0
+        short_limit_alert_sent := false  // Reset alert flag for new signal
+        short_cancel_alert_sent := false
+
+// Update bars since short trigger (always update for active triggers)
+if not na(short_trigger_candle_high)
+    bars_since_short_trigger := bar_index - short_trigger_bar_index
+
+// Cancel short order conditions
+short_bars_exceeded = order_valid_bars > 0 and bars_since_short_trigger > order_valid_bars
+bullish_flip_cancel = ldps_flipped_bullish and strategy.position_size == 0
+
+// ============================================================================
+// ALERT CONDITIONS FOR LIMIT ORDERS (Must be calculated BEFORE trigger resets!)
+// ============================================================================
+
+// Calculate alert trigger conditions
+long_limit_order_signal = ldps_flipped_bullish and ldpm_requirement_met and ldpm_filter_passed and strategy.position_size == 0 and allow_long and opposite_bars_met and na(trigger_candle_low[1])
+
+short_limit_order_signal = ldps_flipped_bearish and bearish_ldpm_requirement_met and bearish_ldpm_filter_passed and strategy.position_size == 0 and allow_short and opposite_bars_met_short and na(short_trigger_candle_high[1])
+
+long_cancel_signal = not na(trigger_candle_low) and strategy.position_size == 0 and (bars_exceeded or bearish_flip_cancel) and not long_cancel_alert_sent
+
+short_cancel_signal = not na(short_trigger_candle_high) and strategy.position_size == 0 and (short_bars_exceeded or bullish_flip_cancel) and not short_cancel_alert_sent
+
+// Position closed signals
+long_position_closed = strategy.position_size == 0 and strategy.position_size[1] > 0
+short_position_closed = strategy.position_size == 0 and strategy.position_size[1] < 0
+
+// Debug plots for cancel signal logic - Long side
+plotchar(not na(trigger_candle_low) ? 1 : 0, title="Long Trigger Exists", char=" ", location=location.top, display=display.data_window)
+plotchar(bearish_flip_cancel ? 1 : 0, title="Bearish Flip Cancel", char=" ", location=location.top, display=display.data_window)
+plotchar(bars_exceeded ? 1 : 0, title="Long Bars Exceeded", char=" ", location=location.top, display=display.data_window)
+plotchar(long_cancel_alert_sent ? 1 : 0, title="Long Cancel Alert Sent", char=" ", location=location.top, display=display.data_window)
+plotchar(long_cancel_signal ? 1 : 0, title="Long Cancel Signal Active", char=" ", location=location.top, display=display.data_window)
+
+// Debug plots for cancel signal logic - Short side
+plotchar(not na(short_trigger_candle_high) ? 1 : 0, title="Short Trigger Exists", char=" ", location=location.top, display=display.data_window)
+plotchar(bullish_flip_cancel ? 1 : 0, title="Bullish Flip Cancel", char=" ", location=location.top, display=display.data_window)
+plotchar(short_bars_exceeded ? 1 : 0, title="Short Bars Exceeded", char=" ", location=location.top, display=display.data_window)
+plotchar(short_cancel_alert_sent ? 1 : 0, title="Short Cancel Alert Sent", char=" ", location=location.top, display=display.data_window)
+plotchar(short_cancel_signal ? 1 : 0, title="Short Cancel Signal Active", char=" ", location=location.top, display=display.data_window)
+
+// Update alert flags
+if long_limit_order_signal
+    long_limit_alert_sent := true
+    long_cancel_alert_sent := false
+
+if short_limit_order_signal
+    short_limit_alert_sent := true
+    short_cancel_alert_sent := false
+
+if long_cancel_signal
+    long_cancel_alert_sent := true
+    long_limit_alert_sent := false
+
+if short_cancel_signal
+    short_cancel_alert_sent := true
+    short_limit_alert_sent := false
+
+// Reset long trigger and cancel pending orders if conditions are met (but NOT if position is already filled)
+if not na(trigger_candle_low) and strategy.position_size == 0 and (bars_exceeded or bearish_flip_cancel)
+    strategy.cancel_all()  // Cancel any pending limit orders
+    trigger_candle_low := na
+    trigger_bar_index := na
+    bars_since_trigger := 0
+
+// Reset short trigger and cancel pending orders if conditions are met (but NOT if position is already filled)
+if not na(short_trigger_candle_high) and strategy.position_size == 0 and (short_bars_exceeded or bullish_flip_cancel)
+    strategy.cancel_all()  // Cancel any pending limit orders
+    short_trigger_candle_high := na
+    short_trigger_bar_index := na
+    bars_since_short_trigger := 0
+
+// Long entry condition: Use stored trigger candle low as entry point with filter check
+long_condition = not na(trigger_candle_low) and strategy.position_size == 0 and ldpm_requirement_met and ldpm_filter_passed
+
+// Short entry condition: Use stored trigger candle high as entry point with filter check
+short_condition = not na(short_trigger_candle_high) and strategy.position_size == 0 and bearish_ldpm_requirement_met and bearish_ldpm_filter_passed
+
+// ============================================================================
+// STRATEGY EXECUTION
+// ============================================================================
+
+// Convert points to ticks (1 point = 4 ticks for NQ/ES)
+stop_ticks = stop_loss_points * 4
+target_ticks = take_profit_points * 4
+
+// Long entry at trigger candle base using limit order
+if long_condition
+    strategy.entry("Long", strategy.long, limit=trigger_candle_low)
+
+// Short entry at trigger candle top using limit order
+if short_condition
+    strategy.entry("Short", strategy.short, limit=short_trigger_candle_high)
+
+// Track when new position is filled
+if strategy.position_size > 0 and strategy.position_size[1] == 0
+    entry_bar_index := bar_index
+    second_tier_active := false
+    // Clear the trigger that was just used to prevent re-entry at same level
+    if not na(trigger_candle_low)
+        trigger_candle_low := na
+        trigger_bar_index := na
+        bars_since_trigger := 0
+
+if strategy.position_size < 0 and strategy.position_size[1] == 0
+    entry_bar_index := bar_index
+    second_tier_active := false
+    // Clear the trigger that was just used to prevent re-entry at same level
+    if not na(short_trigger_candle_high)
+        short_trigger_candle_high := na
+        short_trigger_bar_index := na
+        bars_since_short_trigger := 0
+
+// Standard exit with optional trailing stop and break-even
+if strategy.position_size > 0 and not second_tier_active
+    // Check for break-even stop activation
+    if use_breakeven_stop and not breakeven_active
+        current_profit_points = (high - strategy.position_avg_price) / syminfo.mintick / 4  // Use high for peak profit
+        if current_profit_points >= breakeven_trigger_points
+            breakeven_active := true
+            breakeven_stop_price := strategy.position_avg_price
+
+    // Apply appropriate exit strategy
+    if breakeven_active
+        // Use break-even as stop price
+        if use_trailing_stop
+            trailing_trigger_ticks = trailing_trigger_points * 4
+            trailing_offset_ticks = trailing_offset_points * 4
+            strategy.exit("Long Exit", "Long", stop=breakeven_stop_price, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+        else
+            strategy.exit("Long Exit", "Long", stop=breakeven_stop_price, profit=target_ticks)
+    else
+        // Standard exits without break-even
+        if use_trailing_stop
+            trailing_trigger_ticks = trailing_trigger_points * 4
+            trailing_offset_ticks = trailing_offset_points * 4
+            strategy.exit("Long Exit", "Long", loss=stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+        else
+            strategy.exit("Long Exit", "Long", loss=stop_ticks, profit=target_ticks)
+
+// Check for second tier trailing activation
+if use_second_tier_trailing and strategy.position_size > 0 and not na(entry_bar_index)
+    bars_in_trade = bar_index - entry_bar_index
+
+    if bars_in_trade >= second_tier_bars and not second_tier_active
+        second_tier_active := true
+
+        // Convert points to ticks for second tier
+        second_tier_trigger_ticks = second_tier_trigger * 4
+        second_tier_offset_ticks = second_tier_offset * 4
+
+        // Apply second tier trailing stop (overrides previous exit)
+        strategy.exit("Long Exit", "Long", loss=stop_ticks, profit=target_ticks, trail_points=second_tier_trigger_ticks, trail_offset=second_tier_offset_ticks)
+
+// Standard short exit with optional trailing stop and break-even
+if strategy.position_size < 0 and not second_tier_active
+    // Check for break-even stop activation for shorts
+    if use_breakeven_stop and not breakeven_active
+        current_profit_points = (strategy.position_avg_price - low) / syminfo.mintick / 4  // Use low for peak profit on shorts
+        if current_profit_points >= breakeven_trigger_points
+            breakeven_active := true
+            breakeven_stop_price := strategy.position_avg_price
+
+    // Apply appropriate exit strategy for shorts
+    if breakeven_active
+        // Use break-even as stop price for shorts
+        if use_trailing_stop
+            trailing_trigger_ticks = trailing_trigger_points * 4
+            trailing_offset_ticks = trailing_offset_points * 4
+            strategy.exit("Short Exit", "Short", stop=breakeven_stop_price, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+        else
+            strategy.exit("Short Exit", "Short", stop=breakeven_stop_price, profit=target_ticks)
+    else
+        // Standard exits without break-even for shorts
+        if use_trailing_stop
+            trailing_trigger_ticks = trailing_trigger_points * 4
+            trailing_offset_ticks = trailing_offset_points * 4
+            strategy.exit("Short Exit", "Short", loss=stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+        else
+            strategy.exit("Short Exit", "Short", loss=stop_ticks, profit=target_ticks)
+
+// Check for second tier trailing activation for shorts
+if use_second_tier_trailing and strategy.position_size < 0 and not na(entry_bar_index)
+    bars_in_trade = bar_index - entry_bar_index
+
+    if bars_in_trade >= second_tier_bars and not second_tier_active
+        second_tier_active := true
+
+        // Convert points to ticks for second tier
+        second_tier_trigger_ticks = second_tier_trigger * 4
+        second_tier_offset_ticks = second_tier_offset * 4
+
+        // Apply second tier trailing stop for shorts (overrides previous exit)
+        strategy.exit("Short Exit", "Short", loss=stop_ticks, profit=target_ticks, trail_points=second_tier_trigger_ticks, trail_offset=second_tier_offset_ticks)
+
+// Reset when position closes
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    entry_bar_index := na
+    second_tier_active := false
+    breakeven_active := false  // Reset break-even
+    breakeven_stop_price := na
+    // Don't reset triggers here - let them manage themselves via expiration or flips
+
+// ============================================================================
+// VISUALIZATION AND DEBUGGING
+// ============================================================================
+
+// Mark LDPS flip events
+if show_debug_labels and ldps_flipped_bullish
+    label_text = "LDPS FLIP!" +
+                 "\nBullish LDPM: " + str.tostring(bullish_ldpm_count) +
+                 "\nRequired: " + str.tostring(min_bullish_ldpm) +
+                 "\nLDPM Crossed: " + str.tostring(ldpm_crossed_count) +
+                 "\nMax Allowed: " + str.tostring(max_ldpm_crossed) +
+                 "\nFilter: " + (ldpm_filter_passed ? "PASS" : "FAIL") +
+                 "\nOpposite Bars: " + (opposite_bars_met ? "PASS" : "FAIL")
+
+    label_color = ldpm_requirement_met and ldpm_filter_passed and opposite_bars_met ? color.green : color.orange
+    label.new(bar_index, high + 5, text=label_text, color=label_color, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// Mark LDPS bearish flip events
+if show_debug_labels and ldps_flipped_bearish
+    label_text = "LDPS FLIP BEAR!" +
+                 "\nBearish LDPM: " + str.tostring(bearish_ldpm_count) +
+                 "\nRequired: " + str.tostring(min_bearish_ldpm) +
+                 "\nLDPM Crossed: " + str.tostring(bearish_ldpm_crossed_count) +
+                 "\nMax Allowed: " + str.tostring(max_ldpm_crossed) +
+                 "\nFilter: " + (bearish_ldpm_filter_passed ? "PASS" : "FAIL") +
+                 "\nOpposite Bars: " + (opposite_bars_met_short ? "PASS" : "FAIL")
+
+    label_color = bearish_ldpm_requirement_met and bearish_ldpm_filter_passed and opposite_bars_met_short ? color.red : color.orange
+    label.new(bar_index, low - 5, text=label_text, color=label_color, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+// Mark long trigger candle base
+if not na(trigger_candle_low) and show_debug_labels
+    line.new(trigger_bar_index, trigger_candle_low, bar_index + 10, trigger_candle_low,
+             color=color.blue, width=2, style=line.style_dashed, extend=extend.right)
+    label.new(trigger_bar_index, trigger_candle_low, text="Long Entry: " + str.tostring(trigger_candle_low),
+              color=color.blue, textcolor=color.white, style=label.style_label_upper_left, size=size.small)
+
+// Mark short trigger candle top
+if not na(short_trigger_candle_high) and show_debug_labels
+    line.new(short_trigger_bar_index, short_trigger_candle_high, bar_index + 10, short_trigger_candle_high,
+             color=color.red, width=2, style=line.style_dashed, extend=extend.right)
+    label.new(short_trigger_bar_index, short_trigger_candle_high, text="Short Entry: " + str.tostring(short_trigger_candle_high),
+              color=color.red, textcolor=color.white, style=label.style_label_lower_left, size=size.small)
+
+// Mark long cancel signals
+if long_cancel_signal and show_debug_labels
+    cancel_reason_text = bars_exceeded ? "Time Expired" : "LDPS Flipped Bearish"
+    label_text = "🚫 LONG CANCEL\n" + cancel_reason_text +
+                 "\nBars: " + str.tostring(bars_since_trigger) + "/" + str.tostring(order_valid_bars)
+    label.new(bar_index, high + 10, text=label_text,
+              color=color.new(color.blue, 20), textcolor=color.white,
+              style=label.style_label_down, size=size.normal)
+
+// Mark short cancel signals
+if short_cancel_signal and show_debug_labels
+    cancel_reason_text = short_bars_exceeded ? "Time Expired" : "LDPS Flipped Bullish"
+    label_text = "🚫 SHORT CANCEL\n" + cancel_reason_text +
+                 "\nBars: " + str.tostring(bars_since_short_trigger) + "/" + str.tostring(order_valid_bars)
+    label.new(bar_index, low - 10, text=label_text,
+              color=color.new(color.red, 20), textcolor=color.white,
+              style=label.style_label_up, size=size.normal)
+
+// Visual markers for cancel signals (always visible, not just with debug labels)
+plotshape(long_cancel_signal, title="Long Cancel", style=shape.xcross, location=location.abovebar,
+         color=color.new(color.blue, 30), size=size.normal, text="L-Cancel")
+plotshape(short_cancel_signal, title="Short Cancel", style=shape.xcross, location=location.belowbar,
+         color=color.new(color.red, 30), size=size.normal, text="S-Cancel")
+
+// Data Window Values using plotchar
+plotchar(is_bullish ? 1 : 0, title="LDPS Bullish", char=" ", location=location.top, display=display.data_window)
+plotchar(is_bearish ? 1 : 0, title="LDPS Bearish", char=" ", location=location.top, display=display.data_window)
+plotchar(ldps_flipped_bullish ? 1 : 0, title="LDPS Flip to Bull", char=" ", location=location.top, display=display.data_window)
+plotchar(ldps_flipped_bearish ? 1 : 0, title="LDPS Flip to Bear", char=" ", location=location.top, display=display.data_window)
+plotchar(bullish_ldpm_count, title="Bullish LDPM Count", char=" ", location=location.top, display=display.data_window)
+plotchar(min_bullish_ldpm, title="LDPM Required", char=" ", location=location.top, display=display.data_window)
+plotchar(ldpm_requirement_met ? 1 : 0, title="LDPM Requirement Met", char=" ", location=location.top, display=display.data_window)
+plotchar(trigger_candle_low, title="Trigger Entry Price", char=" ", location=location.top, display=display.data_window)
+plotchar(bars_since_trigger, title="Bars Since Trigger", char=" ", location=location.top, display=display.data_window)
+plotchar(order_valid_bars, title="Order Valid Bars Setting", char=" ", location=location.top, display=display.data_window)
+plotchar(ldpm_crossed_count, title="LDPM Levels Crossed", char=" ", location=location.top, display=display.data_window)
+plotchar(max_ldpm_crossed, title="Max LDPM Crossed Allowed", char=" ", location=location.top, display=display.data_window)
+plotchar(ldpm_filter_passed ? 1 : 0, title="LDPM Filter Passed", char=" ", location=location.top, display=display.data_window)
+plotchar(use_ldpm_filter ? 1 : 0, title="LDPM Filter Enabled", char=" ", location=location.top, display=display.data_window)
+plotchar(strategy.position_size, title="Position Size", char=" ", location=location.top, display=display.data_window)
+plotchar(strategy.openprofit, title="Current P&L", char=" ", location=location.top, display=display.data_window)
+plotchar(strategy.position_avg_price, title="Avg Entry Price", char=" ", location=location.top, display=display.data_window)
+plotchar(use_trailing_stop ? 1 : 0, title="Trailing Stop Enabled", char=" ", location=location.top, display=display.data_window)
+plotchar(second_tier_active ? 1 : 0, title="Second Tier Active", char=" ", location=location.top, display=display.data_window)
+plotchar(not na(entry_bar_index) ? bar_index - entry_bar_index : 0, title="Bars In Trade", char=" ", location=location.top, display=display.data_window)
+plotchar(bearish_ldpm_count, title="Bearish LDPM Count", char=" ", location=location.top, display=display.data_window)
+plotchar(min_bearish_ldpm, title="Bearish LDPM Required", char=" ", location=location.top, display=display.data_window)
+plotchar(bearish_ldpm_requirement_met ? 1 : 0, title="Bearish LDPM Requirement Met", char=" ", location=location.top, display=display.data_window)
+plotchar(short_trigger_candle_high, title="Short Trigger Entry Price", char=" ", location=location.top, display=display.data_window)
+plotchar(bars_since_short_trigger, title="Bars Since Short Trigger", char=" ", location=location.top, display=display.data_window)
+plotchar(bearish_ldpm_crossed_count, title="Bearish LDPM Levels Crossed", char=" ", location=location.top, display=display.data_window)
+plotchar(bearish_ldpm_filter_passed ? 1 : 0, title="Bearish LDPM Filter Passed", char=" ", location=location.top, display=display.data_window)
+plotchar(allow_long ? 1 : 0, title="Allow Long Positions", char=" ", location=location.top, display=display.data_window)
+plotchar(allow_short ? 1 : 0, title="Allow Short Positions", char=" ", location=location.top, display=display.data_window)
+plotchar(opposite_bars_required, title="Opposite Bars Required", char=" ", location=location.top, display=display.data_window)
+plotchar(use_breakeven_stop ? 1 : 0, title="Break-Even Stop Enabled", char=" ", location=location.top, display=display.data_window)
+plotchar(breakeven_trigger_points, title="Break-Even Trigger Points", char=" ", location=location.top, display=display.data_window)
+plotchar(breakeven_active ? 1 : 0, title="Break-Even Active", char=" ", location=location.top, display=display.data_window)
+plotchar(breakeven_stop_price, title="Break-Even Stop Price", char=" ", location=location.top, display=display.data_window)
+
+
+// Calculate alert message values
+long_limit_price = long_limit_order_signal ? math.min(open, close) : na
+long_stop_price = long_limit_order_signal ? math.min(open, close) - stop_loss_points : na
+long_target_price = long_limit_order_signal ? math.min(open, close) + take_profit_points : na
+
+short_limit_price = short_limit_order_signal ? math.max(open, close) : na
+short_stop_price = short_limit_order_signal ? math.max(open, close) + stop_loss_points : na
+short_target_price = short_limit_order_signal ? math.max(open, close) - take_profit_points : na
+
+long_cancel_reason = long_cancel_signal ? (bars_exceeded ? 1 : 2) : na
+short_cancel_reason = short_cancel_signal ? (short_bars_exceeded ? 1 : 2) : na
+
+// Hidden plots for alert message values
+plot(long_limit_price, title="Long Limit Price", display=display.none)
+plot(long_stop_price, title="Long Stop Loss", display=display.none)
+plot(long_target_price, title="Long Take Profit", display=display.none)
+plot(short_limit_price, title="Short Limit Price", display=display.none)
+plot(short_stop_price, title="Short Stop Loss", display=display.none)
+plot(short_target_price, title="Short Take Profit", display=display.none)
+plot(long_cancel_reason, title="Long Cancel Reason", display=display.none)
+plot(short_cancel_reason, title="Short Cancel Reason", display=display.none)
+
+// Strategy Alerts
+if long_limit_order_signal
+    if use_trailing_stop
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(long_limit_price) + ', "stop_loss": ' + str.tostring(long_stop_price) + ', "take_profit": ' + str.tostring(long_target_price) + ', "trailing_trigger": ' + str.tostring(trailing_trigger_points) + ', "trailing_offset": ' + str.tostring(trailing_offset_points) + ', "quantity": 1, "strategy": "LDPS"}', alert.freq_once_per_bar)
+    else
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(long_limit_price) + ', "stop_loss": ' + str.tostring(long_stop_price) + ', "take_profit": ' + str.tostring(long_target_price) + ', "quantity": 1, "strategy": "LDPS"}', alert.freq_once_per_bar)
+
+if short_limit_order_signal
+    if use_trailing_stop
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(short_limit_price) + ', "stop_loss": ' + str.tostring(short_stop_price) + ', "take_profit": ' + str.tostring(short_target_price) + ', "trailing_trigger": ' + str.tostring(trailing_trigger_points) + ', "trailing_offset": ' + str.tostring(trailing_offset_points) + ', "quantity": 1, "strategy": "LDPS"}', alert.freq_once_per_bar)
+    else
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(short_limit_price) + ', "stop_loss": ' + str.tostring(short_stop_price) + ', "take_profit": ' + str.tostring(short_target_price) + ', "quantity": 1, "strategy": "LDPS"}', alert.freq_once_per_bar)
+
+if long_cancel_signal
+    cancel_reason = bars_exceeded ? "expired" : "ldps_flip"
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "cancel_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "reason": "' + cancel_reason + '", "quantity": 1, "strategy": "LDPS"}', alert.freq_once_per_bar)
+
+if short_cancel_signal
+    cancel_reason = short_bars_exceeded ? "expired" : "ldps_flip"
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "cancel_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "reason": "' + cancel_reason + '", "quantity": 1, "strategy": "LDPS"}', alert.freq_once_per_bar)
+
+// Position closed alerts
+if long_position_closed
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "position_closed", "side": "long", "symbol": "' + syminfo.ticker + '", "exit_price": ' + str.tostring(close) + ', "strategy": "LDPS"}', alert.freq_once_per_bar)
+
+if short_position_closed
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "position_closed", "side": "short", "symbol": "' + syminfo.ticker + '", "exit_price": ' + str.tostring(close) + ', "strategy": "LDPS"}', alert.freq_once_per_bar)

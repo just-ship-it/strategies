@@ -1,0 +1,424 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Howitzah
+//@version=6
+strategy("AI Algo with Selective Trailing Stop", overlay=true)
+import Howitzah/common/8 as c
+
+bullPlotLevel = input(close, "Bull Plot Level")
+bearPlotLevel = input(close, "Bear Plot Level")
+ldpm89KF = input(close, "LDPM 89-KF")
+maxStop = input.int(28, "Max Stop")
+ldpmProfitStop = input.int(60, "Profit Stop Protection")
+emaStopLookback = input.int(9, "EMA Stop Lookback")
+bullPlotWeight = input.float(0.33, "Bull Plot Weight", minval=0.01, maxval=1.0, step=0.01, tooltip="How much the bull plot should factor into fills for long position")
+bearPlotWeight = input.float(0.14, "Bull Plot Weight", minval=0.01, maxval=1.0, step=0.01, tooltip="How much the bear plot should factor into fills for short position")
+
+// LDPM Trend Analysis Settings
+useLDPMTrend = input.bool(false, "Use LDPM Trend")
+ldpmTrendPeriod = input.int(21, "LDPM Trend Bars", minval=5, maxval=50, tooltip="Number of bars to analyze LDPM trend")
+ldpmSmoothPeriod = input.int(9, "LDPM Smooth Period", minval=1, maxval=10, tooltip="Smoothing period for LDPM")
+ldpmTrendStrength = input.float(0.1, "LDPM Trend Strength", minval=0.1, maxval=2.0, step=0.1, tooltip="Higher values require stronger trends")
+
+// Trailing Stop Settings
+useTrailingStop = input.bool(false, "Use Trailing Stop")
+stopTrailTrigger = input.int(74, "Trailing Trigger", tooltip="Points in profit before trailing stop activates")
+stopTrailPoints = input.int(50, "Trailing Stop", tooltip="Points away from the highest/lowest price")
+
+// Maximum Run-up Retracement Settings
+useMaxRunupRetracement = input.bool(true, "Use Maximum Run-up Retracement")
+maxRetracement = input.float(40.0, "Maximum Retracement %", minval=5.0, maxval=80.0, step=5.0, tooltip="Exit if price retraces this percentage of maximum run-up")
+minRunupForRetracement = input.int(65, "Minimum Run-up Points",step=5, tooltip="Minimum run-up in points before retracement rule applies")
+
+shortThreshold = input.int(0, "Short Threshold")
+longThreshold = input.int(0, "Long Threshold")
+thresholdLength = input.int(20, "Threshold Length")
+
+enableCoolingPeriod = input.bool(true, title="Enable Cooling Periods", group="Cooling Period Settings")
+longCoolPeriod = input.int(120, "Long Cooling Period")
+shortCoolPeriod = input.int(45, "Short Cooling Period")
+
+// Time-based filtering inputs
+enableTimeFilter = input.bool(true, title="Enable Time-Based Filtering", group="Time Filter Settings")
+bannedLongTimes = input.string("02:30,03:00,03:30,04:00,04:30,08:00,08:30", title="Banned Long Times (30-min intervals)", tooltip="Comma-separated list of times to avoid long trades (format: HH:MM)", group="Time Filter Settings")
+bannedShortTimes = input.string("15:00,15:30,16:00,16:30,21:00,21:30", title="Banned Short Times (30-min intervals)", tooltip="Comma-separated list of times to avoid short trades (format: HH:MM)", group="Time Filter Settings")
+
+// Input parameters
+enablePreMarketClose = input.bool(true, "Enable Pre-Market Close", group="Pre-Market Settings")
+closeHour = input.int(9, "Close Hour (24h format)", minval=0, maxval=23, group="Pre-Market Settings")
+closeMinute = input.int(25, "Close Minute", minval=0, maxval=59, group="Pre-Market Settings")
+showLabel = input.bool(true, "Show Close Time Label", group="Pre-Market Settings")
+
+// Track if we've already closed
+var alreadyClosed = false
+
+// Reset flag after market open
+if hour >= 10
+    alreadyClosed := false
+
+// Get current time in EST
+estHour = hour(time, "America/New_York")
+estMinute = minute(time, "America/New_York")
+
+// Close if we're at or past the target time and haven't closed yet
+// Convert times to minutes
+currentMinutes = estHour * 60 + estMinute
+targetMinutes = closeHour * 60 + closeMinute
+
+// Close condition
+shouldClose = enablePreMarketClose and currentMinutes >= targetMinutes and currentMinutes < 570  // 570 = 9:30 AM
+
+if shouldClose
+    strategy.close_all("Pre-market close")
+
+// Create the boolean variables for time validity
+okTimeForLong = not c.isTimeBanned(bannedLongTimes, enableTimeFilter)
+okTimeForShort = not c.isTimeBanned(bannedShortTimes, enableTimeFilter)
+
+highestHigh = ta.highest(source=high, length=thresholdLength)
+lowestLow = ta.lowest(source=low, length=thresholdLength)
+
+emaLvl = ta.ema(close, 30)
+emaStop = ta.ema(close, emaStopLookback)
+
+// Normalize the point targets by ticks
+maxStop := (maxStop * 4)
+
+var bool canLong = false
+var bool canShort = false
+
+// Variables to track position information
+var float highestSinceEntry = na
+var float lowestSinceEntry = na
+var float currentRunUp = 0.0
+var float maxDrawdown = 0.0
+var int entryTime = 0
+var float runUpPoints = 0
+var float retracementLevel = 0
+var bool trailingStopActive = false
+var float longVolatilityMultiplier = 1
+var float shortVolatilityMultiplier = 1
+
+// Track a bunch of stuff to help us determine better entries / exits
+ema9 = ta.ema(close, 9)
+ema10 = ta.ema(close, 10)
+ema59 = ta.ema(close, 59)
+ema2 = ta.ema(close, 2)
+ema3 = ta.ema(close, 3)
+wma14 = ta.wma(close, 14)
+rsi = ta.rsi(close, 14)
+
+// Add higher timeframe analysis
+// First, define the higher timeframe to check
+higherTf = input.timeframe("240", "Higher Timeframe", options=["60", "120", "240", "D"])
+htfLookback  = input.int(10, "Higher TF Lookback", minval=3, maxval=50)
+supportThreshold = input.int(50, "Support Zone Points", minval=10, maxval=200)
+
+// Calculate how many current timeframe bars make up one higher timeframe bar
+tfRatio = math.round(timeframe.in_seconds(higherTf) / timeframe.in_seconds())
+
+// Get higher timeframe data
+htfLowest = request.security(syminfo.tickerid, higherTf, ta.lowest(low, htfLookback), gaps=barmerge.gaps_off)
+
+// For current developing bar, just look back one higher timeframe period
+currentTfLowest = ta.lowest(low, tfRatio)
+
+// Create a combined lowest that includes both
+combinedLowest = math.min(htfLowest, currentTfLowest)
+
+// Calculate if current price is near support
+nearSupport = math.abs(close - combinedLowest) <= supportThreshold
+
+ldpmThreshold = input.int(10, "LDPM Above Bear Threshold", minval=0, maxval=500, tooltip="Cancel long orders if LDPM is this many points above bearPlotLevel")
+ldpmThresholdClose = input.int(10, "LDPM Above Close", minval=0, maxval=500, tooltip="Cancel long orders if LDPM is this many points above the current bar close")
+
+// Add this to your inputs section
+// Add this to your inputs section
+useIndicatorTrail = input.bool(false, "Use Indicator Trail")
+ldpmTrailOffset = input.int(15, "LDPM Trail Offset", tooltip="Points offset from LDPM for trail stop")
+
+// Variables to track pending orders
+var bool longOrderPending = false
+var float longFillPrice = na
+var bool shortOrderPending = false
+var float shortFillPrice = na
+
+// Calculate smoothed LDPM for better trend detection
+ldpmSmooth = ta.sma(ldpm89KF, ldpmSmoothPeriod)
+
+// Calculate slope using linear regression
+ldpmSlope = ta.linreg(ldpmSmooth, ldpmTrendPeriod, 0) - ta.linreg(ldpmSmooth, ldpmTrendPeriod, ldpmTrendPeriod-1)
+
+// Normalize slope relative to price level for more consistent results
+normalizedSlope = ldpmSlope / ldpmSmooth * 1000
+
+// Determine trend with adjustable strength threshold
+ldpmTrend = normalizedSlope > ldpmTrendStrength ? "UP" : 
+           normalizedSlope < -ldpmTrendStrength ? "DOWN" : "FLAT"
+
+// Apply trend to trading logic (with buffer for recent trend changes)
+var int trendChangeBar = 0
+if ldpmTrend != ldpmTrend[1]
+    trendChangeBar := bar_index
+
+// Only long when LDPM is not in a downtrend (or is in an uptrend)
+bool ldpmOkForLong = not useLDPMTrend or ldpmTrend != "UP"
+
+bool emaOKforLong = ema9 < close or ema59 < close
+
+// Only short when LDPM is not in a downtrend (or is in a downtrend)
+// Added additional filter - don't short when LDPM has been declining for several bars
+bool ldpmOkForShort = not useLDPMTrend or ldpmTrend != "DOWN"
+
+// Reset tracking variables when not in a position
+if not c.IsLong() and not c.IsShort()
+    highestSinceEntry := na
+    lowestSinceEntry := na
+    currentRunUp := 0.0
+    maxDrawdown := 0.0
+    trailingStopActive := false
+    runUpPoints := 0
+    retracementLevel := 0
+
+///////////////////////////  Cooling off period after losing trades /////////////////////
+// Variables to track consecutive losses and cooling periods
+var float lastLongLossTime = 0.0
+var bool longCoolingPeriod = false
+var int consecutiveShortLosses = 0
+var float lastShortLossTime = 0.0
+var bool shortCoolingPeriod = false
+
+// Detect trade exits
+if (enableCoolingPeriod and strategy.closedtrades > 0 and strategy.closedtrades.exit_bar_index(strategy.closedtrades - 1) == bar_index)
+    // Determine if the closed trade was profitable
+    isLoss = strategy.closedtrades.profit(strategy.closedtrades - 1) < 0
+    
+    // Check if it was a long or short trade
+    isLong = strategy.closedtrades.size(strategy.closedtrades - 1) > 0
+    
+    if (isLong)
+        // Handle long trade exits
+        if (isLoss)
+            // Activate cooling period for long trades immediately on any loss
+            longCoolingPeriod := true
+            lastLongLossTime := time
+    else
+        // Handle short trade exits
+        if (isLoss)
+            // Increment consecutive short loss counter
+            consecutiveShortLosses := consecutiveShortLosses + 1
+            
+            // Activate cooling period if we have 2 consecutive short losses
+            if (consecutiveShortLosses >= 2)
+                shortCoolingPeriod := true
+                lastShortLossTime := time
+        else
+            // Reset counter if we had a winning short trade
+            consecutiveShortLosses := 0
+
+// Check if cooling periods should be reset based on time elapsed
+// Reset long cooling period (120 minutes)
+if (enableCoolingPeriod and longCoolingPeriod and (time - lastLongLossTime) >= longCoolPeriod * 60 * 1000)
+    longCoolingPeriod := false
+
+// Reset short cooling period (45 minutes)
+if (enableCoolingPeriod and shortCoolingPeriod and (time - lastShortLossTime) >= shortCoolPeriod * 60 * 1000)
+    shortCoolingPeriod := false
+    consecutiveShortLosses := 0  // Reset consecutive counter after cooling period
+///////////////////////////  END Cooling off period after losing side trades /////////////////////
+
+// Check if conditions have flipped bearish while the order is pending
+if (longOrderPending)
+    // Simplified condition: bearPlotLevel is active, price closed below it,
+    // and LDPM is above bearPlotLevel by the threshold
+    bearishFlip = (bearPlotLevel > 0 and close < bearPlotLevel and ldpm89KF > bearPlotLevel + ldpmThreshold) or (close < ldpm89KF - ldpmThresholdClose)
+    
+    if (bearishFlip)
+        // Cancel all pending orders
+        strategy.cancel_all()
+        strategy.close_all(comment = "Bearish flip, closing all longs")
+        
+        // Add cancellation label
+        label.new(bar_index, high, "LONG ORDER\nCANCELLED\nBearish Flip", color=color.orange, style=label.style_label_down, textcolor=color.white)
+        
+        // Reset the pending order flag
+        longOrderPending := false
+        longFillPrice := na
+
+// Reset the pending order flag when a position is opened or the price moves beyond the fill price
+if (longOrderPending and strategy.position_size > 0 and strategy.position_size[1] == 0)
+    longOrderPending := false
+    longFillPrice := na
+
+vwap = ta.vwap(close)
+
+// Look for longs as long as we are in a bullish trend up
+// Look for a close above LDPM-89
+// Aim for a fill at the average of the plot, ema, and ldpm89
+if (not longCoolingPeriod and bullPlotLevel > 0 and low < ldpm89KF and close > ldpm89KF and close > open and ldpmOkForLong and rsi < 65 and okTimeForLong)
+    //longFillPrice := math.ceil((math.ceil(bullPlotLevel) + math.ceil(ldpm89KF) + math.ceil(emaLvl)) / 3) - longThreshold
+    remWeight = (1 - bullPlotWeight) / 2
+    longFillPrice := math.ceil((bullPlotLevel * bullPlotWeight) + (ldpm89KF * remWeight) + (emaLvl * remWeight))
+
+    // Set the pending order flag
+    longOrderPending := true
+
+    metadata = "bullPlotLevel: " + str.tostring(math.ceil(bullPlotLevel)) +  ", ldpm89KF: " + str.tostring(math.ceil(ldpm89KF)) + ", emaLvl: " + str.tostring(math.ceil(emaLvl)) + ", vwap:" + str.tostring(math.ceil(vwap))
+
+    label.new(bar_index, low, "LONG\nCondition Triggered\nFill: " + str.tostring(longFillPrice ), color=color.green, style=label.style_label_up, textcolor=color.white)
+
+    // Close any short side positions if we get a long signal
+    // Cancel any other pending orders
+    strategy.cancel_all()
+    strategy.close("AI Short", "Long signal received")    
+
+    // Enter long position
+    strategy.entry("AI Long", strategy.long, limit = longFillPrice, comment = metadata )
+    // Setup max stop loss and partial profit taking where applicable
+    if (useTrailingStop)
+        strategy.exit("Exit Long", from_entry = "AI Long", loss = maxStop, comment = "Stop loss hit", trail_points = (stopTrailTrigger * 4), trail_offset = (stopTrailPoints * 4))
+    else
+        strategy.exit("Exit Long", from_entry = "AI Long", loss = maxStop, comment = "Stop loss hit")
+   
+bearishLDPMCandles = (high > ldpm89KF and (close < ldpm89KF - shortThreshold) and close < open)// or (high[1] > ldpm89KF[1] and open < ldpm89KF and close < open)
+
+// Look for shorts as long as we are in a bearish trend down
+if (not shortCoolingPeriod and bearPlotLevel > 0 and bearishLDPMCandles and ldpmOkForShort and rsi > 35 and not nearSupport and okTimeForShort)
+//    fill = math.min(bearPlotLevel, emaLvl, ldpm89KF, close + shortThreshold)
+    remWeight = (1 - bearPlotWeight) / 2
+    shortFillPrice := math.ceil((bearPlotLevel * bearPlotWeight) + (ldpm89KF * remWeight) + (emaLvl * remWeight))
+
+    label.new(bar_index, high, "SHORT\nCondition Triggered\nFill: " + str.tostring(shortFillPrice), color=color.red, style=label.style_label_down, textcolor=color.white)
+
+    // Ensure no long order pending
+    // Cancel any pending orders
+    longOrderPending := false
+    strategy.cancel_all()
+
+    // Enter short position
+    // If we closed below VWAP, or we closed below multiple other EMAs, take it immediately
+    //if (close < vwap or (close < ema3 and close < ema10 and close < wma14 and close < ldpm89KF))
+    strategy.entry("AI Short", strategy.short)
+    // Otherwise we wait for a better fill
+    //else 
+    //    strategy.entry("AI Short", strategy.short, limit = shortFillPrice)
+
+    // Setup max stop loss
+    if (useTrailingStop)
+        strategy.exit("Exit Short", from_entry = "AI Short", loss = maxStop, comment = "Stop loss hit", trail_points = (stopTrailTrigger * 4), trail_offset = (stopTrailPoints * 4))
+    else    
+        strategy.exit("Exit Short", from_entry = "AI Short", loss = maxStop, comment = "Stop loss hit")
+
+// Track metrics for the current position
+if c.IsLong() or c.IsShort()
+    
+    // Calculate run-up and drawdown
+    if c.IsLong()
+        // For long positions
+        if na(highestSinceEntry)
+            highestSinceEntry := high
+        else
+            highestSinceEntry := math.max(highestSinceEntry, high)
+        
+        currentRunUp := (highestSinceEntry - strategy.position_avg_price) * 20 // $20 per point for NQ
+        maxDrawdown := math.max(maxDrawdown, (strategy.position_avg_price - math.min(low,strategy.position_avg_price)) * 20)
+    else
+        // For short positions
+        if na(lowestSinceEntry)
+            lowestSinceEntry := low
+        else
+            lowestSinceEntry := math.min(lowestSinceEntry, low)
+        
+        currentRunUp := (strategy.position_avg_price - lowestSinceEntry) * 20 // $20 per point for NQ
+        maxDrawdown := math.max(maxDrawdown, (math.max(high, strategy.position_avg_price) - strategy.position_avg_price) * 20)
+    
+    // Apply maximum run-up retracement rule
+    if useMaxRunupRetracement
+        // For long positions
+        if c.IsLong()
+            // Calculate run-up in points
+            runUpPoints := (highestSinceEntry - strategy.position_avg_price)
+            
+            // Only apply if we have sufficient run-up
+            if runUpPoints >= minRunupForRetracement
+                // Calculate the retracement level
+                retracementLevel := highestSinceEntry - (runUpPoints * maxRetracement / 100)
+                
+                // Update the strategy stop loss to move with the retracement level??
+                strategy.exit("Exit Long", from_entry = "AI Long", stop=retracementLevel, comment="Max Runup Retracement")
+        
+        // For short positions
+        if c.IsShort()
+            // Calculate run-up in points
+            runUpPoints := (strategy.position_avg_price - lowestSinceEntry)
+            
+            // Only apply if we have sufficient run-up
+            if runUpPoints >= minRunupForRetracement
+                // Calculate the retracement level
+                retracementLevel := lowestSinceEntry + (runUpPoints * maxRetracement / 100)
+
+                // Update the strategy stop loss to move with the retracement level??    
+                strategy.exit("Exit Short", from_entry = "AI Short", stop=retracementLevel, comment="Max Runup Retracement")
+
+// Original exit conditions - unmodified
+// Close any longs if close below ldpm89 or emastop if we're in profit
+emaLongStop = emaStopLookback > 0 and close < emaStop
+if (c.IsLong() and c.getMaxRunup() > ldpmProfitStop and (close < ldpm89KF or emaLongStop))
+    strategy.close("AI Long", comment = "EMA Long Stop")
+
+// Close any shorts if close above ldpm89 or ema stop if we're in profit
+emaShortStop = emaStopLookback > 0 and close > emaStop
+if (c.IsShort() and c.getMaxRunup() > ldpmProfitStop and (close > ldpm89KF or emaShortStop))
+    strategy.close("AI Short", comment = "EMA Short Stop")
+
+// Original plot elements - unmodified
+plotchar(bullPlotLevel, "Bull Plot", "", location = location.top)
+plotchar(bearPlotLevel, "Bear Plot", "", location = location.top)
+plotchar(ldpm89KF, "LDPM-89", "", location = location.top)
+plotchar(emaLvl, "EMA LVL", "", location = location.top)
+
+// Trailing stop level visualization
+var float longStopLevel = na
+var float shortStopLevel = na
+
+// Update the level values (this must be done outside plotchar calls)
+if useTrailingStop and c.IsLong() and trailingStopActive
+    longStopLevel := highestSinceEntry - stopTrailPoints
+else
+    longStopLevel := na
+    
+if useTrailingStop and c.IsShort() and trailingStopActive
+    shortStopLevel := lowestSinceEntry + stopTrailPoints
+else
+    shortStopLevel := na
+
+// Plot indicators for the trailing stop levels
+plotchar(bearPlotLevel, "Bear Plot Level", "", location = location.top)
+plotchar(bullPlotLevel, "Bear Plot Level", "", location = location.top)
+plotchar(longFillPrice, "Long Fill Price", "", location = location.top)
+plotchar(shortFillPrice, "Short Fill Price", "", location = location.top)
+plotchar(longOrderPending, "Long Order Pending", "", location = location.top)
+plotchar(ldpm89KF - ldpmThresholdClose, "Bear Close", "", location = location.top)
+plotchar(ldpmThresholdClose, "Bear Threshold Close", "", location = location.top)
+plotchar(shortOrderPending, "Short Order Pending", "", location = location.top)
+plotchar(maxDrawdown, "Max Drawdown", "", location = location.top)
+plotchar(currentRunUp, "Current Run Up", "", location = location.top)
+plotchar(c.curProfitInPts(), "Points in Profit", "", location = location.top)
+plotchar(strategy.position_avg_price, "Entry Price", "", location = location.top)
+plotchar(longCoolingPeriod, "Long Cooling Period", "", location = location.top)
+plotchar(shortCoolingPeriod, "Short Cooling Period", "", location = location.top)
+plotchar(strategy.position_avg_price, "Entry Price", "", location = location.top)
+plotchar(ema9, "EMA9", "", location = location.top)
+plotchar(highestSinceEntry, "Highest Since Entry", "", location = location.top)
+plotchar(lowestSinceEntry, "Lowest Since Entry", "", location = location.top)
+plotchar(runUpPoints, "Run Up Points", "", location = location.top)
+plotchar(retracementLevel, "Retracement Level", "", location = location.top)
+
+plotchar(enablePreMarketClose, "enablePreMarketClose", "", location = location.top)
+plotchar(currentMinutes, "currentMinutes", "", location = location.top)
+plotchar(targetMinutes, "targetMinutes", "", location = location.top)
+
+plotchar(longStopLevel, "Long Stop", "•", location.absolute, color.red, 0, size=size.tiny)
+plotchar(shortStopLevel, "Short Stop", "•", location.absolute, color.red, 0, size=size.tiny)
+plotshape(ldpmTrend == "UP", "LDPM Up", shape.triangleup, location.top, color.green, 0, size=size.tiny)
+plotshape(ldpmTrend == "DOWN", "LDPM Down", shape.triangledown, location.top, color.red, 0, size=size.tiny)
+plotshape(ldpmTrend == "FLAT", "LDPM Flat", shape.square, location.top, color.gray, 0, size=size.tiny)

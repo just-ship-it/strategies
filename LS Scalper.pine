@@ -1,0 +1,190 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Howitzah
+
+//@version=6
+strategy("LDPS Scalper", overlay=true)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// LDPS Signal Inputs (from external indicator)
+ldps_is_bullish = input.source(title="LDPS Is Bullish", defval=close, group="LDPS Settings")
+ldps_is_bearish = input.source(title="LDPS Is Bearish", defval=close, group="LDPS Settings")
+
+// Scalp Target Settings
+take_profit_points = input.int(title="Take Profit (Points)", defval=8, minval=1, maxval=50, group="Scalp Settings")
+stop_loss_points = input.int(title="Stop Loss (Points)", defval=6, minval=1, maxval=50, group="Scalp Settings")
+
+// Trailing Stop Settings
+use_trailing_stop = input.bool(false, title="Enable Trailing Stop", group="Trailing Stop")
+trailing_trigger_points = input.float(title="Trailing Trigger (Points)", defval=5.0, minval=1, step=1, group="Trailing Stop", tooltip="Points in profit before trailing stop activates")
+trailing_offset_points = input.float(title="Trailing Offset (Points)", defval=3.0, minval=1, step=1, group="Trailing Stop", tooltip="Points behind the peak price")
+
+// Webhook Settings
+webhook_secret = input.string(title="Webhook Secret", defval="", group="Webhook Settings", tooltip="Secret key for webhook authentication")
+
+// ============================================================================
+// LDPS SIGNAL PROCESSING
+// ============================================================================
+
+// Convert LDPS inputs to boolean values
+is_bullish = ldps_is_bullish > 0
+is_bearish = ldps_is_bearish > 0
+
+// Detect LDPS flips - simpler logic: just went from not-bullish to bullish (or vice versa)
+ldps_flipped_bullish = is_bullish and not is_bullish[1]
+ldps_flipped_bearish = is_bearish and not is_bearish[1]
+
+// ============================================================================
+// STRATEGY EXECUTION
+// ============================================================================
+
+// Convert points to ticks (1 point = 4 ticks for NQ)
+stop_ticks = stop_loss_points * 4
+target_ticks = take_profit_points * 4
+trailing_trigger_ticks = trailing_trigger_points * 4
+trailing_offset_ticks = trailing_offset_points * 4
+
+// Track pending limit orders
+var int long_order_bar = na
+var int short_order_bar = na
+
+// Cancel unfilled limit orders after 1 bar
+if not na(long_order_bar) and bar_index > long_order_bar
+    strategy.cancel("Long")
+    long_order_bar := na
+
+if not na(short_order_bar) and bar_index > short_order_bar
+    strategy.cancel("Short")
+    short_order_bar := na
+
+// Clear tracking when filled
+if strategy.position_size > 0 and strategy.position_size[1] <= 0
+    long_order_bar := na
+
+if strategy.position_size < 0 and strategy.position_size[1] >= 0
+    short_order_bar := na
+
+// Track cancellations for visualization
+var bool long_cancelled = false
+var bool short_cancelled = false
+long_cancelled := false
+short_cancelled := false
+
+// Only allow new entries when flat (no position flipping)
+is_flat = strategy.position_size == 0
+
+// Long entry on bullish flip - limit order at close
+if ldps_flipped_bullish and is_flat
+    // Cancel any pending short order
+    if not na(short_order_bar)
+        strategy.cancel("Short")
+        short_order_bar := na
+        short_cancelled := true
+
+    strategy.entry("Long", strategy.long, limit=close)
+    long_order_bar := bar_index
+    if use_trailing_stop
+        strategy.exit("Exit Long", "Long", loss=stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else
+        strategy.exit("Exit Long", "Long", loss=stop_ticks, profit=target_ticks)
+
+// Short entry on bearish flip - limit order at close
+if ldps_flipped_bearish and is_flat
+    // Cancel any pending long order
+    if not na(long_order_bar)
+        strategy.cancel("Long")
+        long_order_bar := na
+        long_cancelled := true
+
+    strategy.entry("Short", strategy.short, limit=close)
+    short_order_bar := bar_index
+    if use_trailing_stop
+        strategy.exit("Exit Short", "Short", loss=stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else
+        strategy.exit("Exit Short", "Short", loss=stop_ticks, profit=target_ticks)
+
+// Track expiration cancellations
+var bool long_expired = false
+var bool short_expired = false
+long_expired := not na(long_order_bar[1]) and na(long_order_bar) and strategy.position_size <= 0
+short_expired := not na(short_order_bar[1]) and na(short_order_bar) and strategy.position_size >= 0
+
+// ============================================================================
+// VISUALIZATION
+// ============================================================================
+
+// Show limit order placements
+plotshape(ldps_flipped_bullish, title="Long Limit Placed", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="L")
+plotshape(ldps_flipped_bearish, title="Short Limit Placed", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="S")
+
+// Show cancellations (due to opposite signal)
+plotshape(long_cancelled, title="Long Cancelled (Flip)", style=shape.xcross, location=location.belowbar, color=color.orange, size=size.small, text="Lx")
+plotshape(short_cancelled, title="Short Cancelled (Flip)", style=shape.xcross, location=location.abovebar, color=color.orange, size=size.small, text="Sx")
+
+// Show expirations (unfilled after 1 bar)
+plotshape(long_expired, title="Long Expired", style=shape.xcross, location=location.belowbar, color=color.gray, size=size.tiny)
+plotshape(short_expired, title="Short Expired", style=shape.xcross, location=location.abovebar, color=color.gray, size=size.tiny)
+
+// ============================================================================
+// DATA WINDOW TRACKING
+// ============================================================================
+
+plotchar(is_bullish ? 1 : 0, title="LDPS Bullish", char=" ", location=location.top, display=display.data_window)
+plotchar(is_bearish ? 1 : 0, title="LDPS Bearish", char=" ", location=location.top, display=display.data_window)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+// Track alert conditions
+long_limit_placed = ldps_flipped_bullish and is_flat
+short_limit_placed = ldps_flipped_bearish and is_flat
+
+// Calculate prices for alerts
+long_limit_price = close
+long_stop_price = close - stop_loss_points
+long_target_price = close + take_profit_points
+
+short_limit_price = close
+short_stop_price = close + stop_loss_points
+short_target_price = close - take_profit_points
+
+// Cancel signals
+long_cancel_signal = long_expired or long_cancelled
+short_cancel_signal = short_expired or short_cancelled
+
+// Position closed signals
+long_position_closed = strategy.position_size == 0 and strategy.position_size[1] > 0
+short_position_closed = strategy.position_size == 0 and strategy.position_size[1] < 0
+
+// Long limit order alert
+if long_limit_placed
+    if use_trailing_stop
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(long_limit_price) + ', "stop_loss": ' + str.tostring(long_stop_price) + ', "take_profit": ' + str.tostring(long_target_price) + ', "trailing_trigger": ' + str.tostring(trailing_trigger_points) + ', "trailing_offset": ' + str.tostring(trailing_offset_points) + ', "quantity": 1, "strategy": "LDPS_Scalper"}', alert.freq_once_per_bar)
+    else
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(long_limit_price) + ', "stop_loss": ' + str.tostring(long_stop_price) + ', "take_profit": ' + str.tostring(long_target_price) + ', "quantity": 1, "strategy": "LDPS_Scalper"}', alert.freq_once_per_bar)
+
+// Short limit order alert
+if short_limit_placed
+    if use_trailing_stop
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(short_limit_price) + ', "stop_loss": ' + str.tostring(short_stop_price) + ', "take_profit": ' + str.tostring(short_target_price) + ', "trailing_trigger": ' + str.tostring(trailing_trigger_points) + ', "trailing_offset": ' + str.tostring(trailing_offset_points) + ', "quantity": 1, "strategy": "LDPS_Scalper"}', alert.freq_once_per_bar)
+    else
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(short_limit_price) + ', "stop_loss": ' + str.tostring(short_stop_price) + ', "take_profit": ' + str.tostring(short_target_price) + ', "quantity": 1, "strategy": "LDPS_Scalper"}', alert.freq_once_per_bar)
+
+// Cancel alerts
+if long_cancel_signal
+    cancel_reason = long_expired ? "expired" : "cancelled"
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "cancel_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "reason": "' + cancel_reason + '", "quantity": 1, "strategy": "LDPS_Scalper"}', alert.freq_once_per_bar)
+
+if short_cancel_signal
+    cancel_reason = short_expired ? "expired" : "cancelled"
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "cancel_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "reason": "' + cancel_reason + '", "quantity": 1, "strategy": "LDPS_Scalper"}', alert.freq_once_per_bar)
+
+// Position closed alerts
+if long_position_closed
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "position_closed", "side": "long", "symbol": "' + syminfo.ticker + '", "exit_price": ' + str.tostring(close) + ', "strategy": "LDPS_Scalper"}', alert.freq_once_per_bar)
+
+if short_position_closed
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "position_closed", "side": "short", "symbol": "' + syminfo.ticker + '", "exit_price": ' + str.tostring(close) + ', "strategy": "LDPS_Scalper"}', alert.freq_once_per_bar)
