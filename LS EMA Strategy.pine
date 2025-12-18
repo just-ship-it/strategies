@@ -1,0 +1,443 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Howitzah
+
+//@version=6
+strategy("LS EMA Strategy", overlay=true, pyramiding=1, default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// LS (Liquidity Stability) Signal Inputs (from external indicator)
+ls_bullish = input.source(title="LS Bullish", defval=close, group="LS Settings", tooltip="Boolean signal from LS indicator (1 = bullish, 0 = not bullish)")
+ls_bearish = input.source(title="LS Bearish", defval=close, group="LS Settings", tooltip="Boolean signal from LS indicator (1 = bearish, 0 = not bearish)")
+
+// Entry Level Settings
+use_separate_levels = input.bool(false, title="Use Separate Long/Short Levels", group="Entry Levels", tooltip="Enable different entry levels for longs vs shorts")
+ema_value = input.source(title="Single Entry Level", defval=close, group="Entry Levels", tooltip="Entry level when using single level for both directions")
+long_entry_level = input.source(title="Long Entry Level", defval=close, group="Entry Levels", tooltip="Entry level for long positions (e.g., VWAP Lower)")
+short_entry_level = input.source(title="Short Entry Level", defval=close, group="Entry Levels", tooltip="Entry level for short positions (e.g., VWAP Upper)")
+min_spread_points = input.float(title="Minimum Spread (Points)", defval=0.0, minval=0.0, step=1.0, group="Entry Levels", tooltip="Minimum points between long and short levels to consider trade valid (0 = no minimum)")
+
+// Stop Loss Settings
+stop_loss_points = input.float(title="Stop Loss (Points)", defval=10.0, minval=1.0, step=1.0, group="Risk Management", tooltip="Maximum stop loss in points (NOT ticks)")
+
+// Trailing Stop Settings
+use_trailing_stop = input.bool(false, title="Enable Trailing Stop", group="Trailing Stop")
+trailing_trigger_points = input.float(title="Trailing Trigger (Points)", defval=5.0, minval=1.0, step=1.0, group="Trailing Stop", tooltip="Points in profit before trailing stop activates")
+trailing_offset_points = input.float(title="Trailing Offset (Points)", defval=3.0, minval=1.0, step=1.0, group="Trailing Stop", tooltip="Points behind the peak price for trailing stop")
+
+// Visualization Settings
+show_ema_line = input.bool(true, title="Show EMA Line", group="Visualization")
+show_signals = input.bool(true, title="Show Entry Signals", group="Visualization")
+show_debug_labels = input.bool(false, title="Show Debug Labels", group="Visualization")
+
+// Entry Management Settings
+enable_cooldown = input.bool(true, title="Enable Entry Cooldown", group="Entry Management", tooltip="Prevent immediate re-entry after position closes")
+cooldown_bars = input.int(title="Cooldown Period (Bars)", defval=2, minval=0, maxval=10, group="Entry Management", tooltip="Number of bars to wait before allowing re-entry in same direction")
+
+// Webhook Settings
+webhook_secret = input.string(title="Webhook Secret", defval="", group="Webhook Settings", tooltip="Secret key for webhook authentication")
+
+// ============================================================================
+// PRICE ROUNDING FUNCTION
+// ============================================================================
+
+// Function to round prices to nearest tick (using syminfo.mintick)
+round_to_tick(price) =>
+    math.round(price / syminfo.mintick) * syminfo.mintick
+
+// ============================================================================
+// SIGNAL PROCESSING
+// ============================================================================
+
+// Convert LS inputs to boolean values (assuming non-zero values represent true)
+is_bullish = ls_bullish > 0
+is_bearish = ls_bearish > 0
+
+// Detect LS flips
+ls_flipped_bullish = is_bullish and not is_bullish[1]
+ls_flipped_bearish = is_bearish and not is_bearish[1]
+
+// Track the current LS state
+var string current_ls_state = "neutral"
+if is_bullish
+    current_ls_state := "bullish"
+else if is_bearish
+    current_ls_state := "bearish"
+else
+    current_ls_state := "neutral"
+
+// Check if state changed
+ls_state_changed = current_ls_state != current_ls_state[1]
+
+// ============================================================================
+// ORDER MANAGEMENT VARIABLES
+// ============================================================================
+
+// Track pending order state
+var bool has_pending_long = false
+var bool has_pending_short = false
+var float last_long_limit_price = na
+var float last_short_limit_price = na
+
+// Alert state tracking to prevent duplicates
+var bool long_place_alert_sent = false
+var bool short_place_alert_sent = false
+var bool long_update_alert_sent = false
+var bool short_update_alert_sent = false
+var bool long_cancel_alert_sent = false
+var bool short_cancel_alert_sent = false
+
+// Exit tracking for cooldown management
+var int long_exit_bar = na
+var int short_exit_bar = na
+
+// Check if we're flat (no position)
+is_flat = strategy.position_size == 0
+
+// Track when positions close
+if strategy.position_size[1] > 0 and strategy.position_size == 0
+    long_exit_bar := bar_index
+
+if strategy.position_size[1] < 0 and strategy.position_size == 0
+    short_exit_bar := bar_index
+
+// Calculate if we're in cooldown period
+bars_since_long_exit = not na(long_exit_bar) ? bar_index - long_exit_bar : na
+bars_since_short_exit = not na(short_exit_bar) ? bar_index - short_exit_bar : na
+
+long_cooldown_active = enable_cooldown and not na(bars_since_long_exit) and bars_since_long_exit < cooldown_bars
+short_cooldown_active = enable_cooldown and not na(bars_since_short_exit) and bars_since_short_exit < cooldown_bars
+
+// Dynamic level selection based on user preference
+active_long_level = use_separate_levels ? long_entry_level : ema_value
+active_short_level = use_separate_levels ? short_entry_level : ema_value
+
+// Round entry levels to nearest tick
+long_level_rounded = round_to_tick(active_long_level)
+short_level_rounded = round_to_tick(active_short_level)
+
+// Keep ema_rounded for backward compatibility with existing data window displays
+ema_rounded = round_to_tick(ema_value)
+
+// Calculate spread between long and short levels when using separate levels
+level_spread = use_separate_levels ? math.abs(short_level_rounded - long_level_rounded) : 0.0
+spread_valid = min_spread_points == 0.0 or (not use_separate_levels) or level_spread >= min_spread_points
+
+// Determine if we should have a pending order based on current LS state, cooldown, and spread validation
+should_have_long_pending = is_bullish and is_flat and long_level_rounded < close and not long_cooldown_active and spread_valid
+should_have_short_pending = is_bearish and is_flat and short_level_rounded > close and not short_cooldown_active and spread_valid
+
+// ============================================================================
+// STRATEGY EXECUTION
+// ============================================================================
+
+// Convert points to ticks (1 point = 4 ticks for futures)
+stop_loss_ticks = stop_loss_points * 4
+trailing_trigger_ticks = use_trailing_stop ? trailing_trigger_points * 4 : na
+trailing_offset_ticks = use_trailing_stop ? trailing_offset_points * 4 : na
+
+// Cancel orders when LS flips or conditions no longer met
+if has_pending_long and (is_bearish or not should_have_long_pending)
+    strategy.cancel("Long")
+    has_pending_long := false
+    last_long_limit_price := na
+
+if has_pending_short and (is_bullish or not should_have_short_pending)
+    strategy.cancel("Short")
+    has_pending_short := false
+    last_short_limit_price := na
+
+// Cancel orders specifically when spread becomes invalid
+if has_pending_long and use_separate_levels and min_spread_points > 0.0 and not spread_valid and not long_cancel_alert_sent
+    strategy.cancel("Long")
+    has_pending_long := false
+    last_long_limit_price := na
+    // Send cancel_limit alert for spread validation failure
+    alert('{' +
+          '"action": "cancel_limit",' +
+          '"side": "buy",' +
+          '"symbol": "' + syminfo.ticker + '",' +
+          '"reason": "spread_invalid",' +
+          '"spread": ' + str.tostring(level_spread, "#.##") + ',' +
+          '"min_required": ' + str.tostring(min_spread_points, "#.##") + ',' +
+          '"strategy": "LS_EMA",' +
+          '"timestamp": "' + str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'") + '"' +
+          '}', "LS EMA: Cancel Limit (Spread Invalid)")
+    long_cancel_alert_sent := true
+    long_place_alert_sent := false
+    long_update_alert_sent := false
+
+if has_pending_short and use_separate_levels and min_spread_points > 0.0 and not spread_valid and not short_cancel_alert_sent
+    strategy.cancel("Short")
+    has_pending_short := false
+    last_short_limit_price := na
+    // Send cancel_limit alert for spread validation failure
+    alert('{' +
+          '"action": "cancel_limit",' +
+          '"side": "sell",' +
+          '"symbol": "' + syminfo.ticker + '",' +
+          '"reason": "spread_invalid",' +
+          '"spread": ' + str.tostring(level_spread, "#.##") + ',' +
+          '"min_required": ' + str.tostring(min_spread_points, "#.##") + ',' +
+          '"strategy": "LS_EMA",' +
+          '"timestamp": "' + str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'") + '"' +
+          '}', "LS EMA: Cancel Limit (Spread Invalid)")
+    short_cancel_alert_sent := true
+    short_place_alert_sent := false
+    short_update_alert_sent := false
+
+// Place or update long limit orders
+if should_have_long_pending
+    // Check if we need to place a new order or update existing one
+    if not has_pending_long or last_long_limit_price != long_level_rounded
+        strategy.entry("Long", strategy.long, limit=long_level_rounded)
+        has_pending_long := true
+        last_long_limit_price := long_level_rounded
+
+// Place or update short limit orders
+if should_have_short_pending
+    // Check if we need to place a new order or update existing one
+    if not has_pending_short or last_short_limit_price != short_level_rounded
+        strategy.entry("Short", strategy.short, limit=short_level_rounded)
+        has_pending_short := true
+        last_short_limit_price := short_level_rounded
+
+// Exit conditions - positions only close via stops/trailing stops
+if strategy.position_size > 0
+    if use_trailing_stop
+        strategy.exit("Exit Long", "Long", loss=stop_loss_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else
+        strategy.exit("Exit Long", "Long", loss=stop_loss_ticks)
+
+if strategy.position_size < 0
+    if use_trailing_stop
+        strategy.exit("Exit Short", "Short", loss=stop_loss_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else
+        strategy.exit("Exit Short", "Short", loss=stop_loss_ticks)
+
+// Reset pending order tracking when position is filled
+if strategy.position_size > 0 and strategy.position_size[1] == 0
+    has_pending_long := false
+    last_long_limit_price := na
+
+if strategy.position_size < 0 and strategy.position_size[1] == 0
+    has_pending_short := false
+    last_short_limit_price := na
+
+// ============================================================================
+// VISUALIZATION
+// ============================================================================
+
+// Calculate ATR once for visualization (to avoid using ta functions in conditional logic)
+atr_value = ta.atr(14)
+
+// Plot entry level lines (conditional logic moved to plot values)
+plot(show_ema_line and use_separate_levels ? active_long_level : na, title="Long Entry Level", color=color.green, linewidth=1, style=plot.style_line)
+plot(show_ema_line and use_separate_levels ? active_short_level : na, title="Short Entry Level", color=color.red, linewidth=1, style=plot.style_line)
+plot(show_ema_line and not use_separate_levels ? ema_value : na, title="Single Entry Level", color=color.blue, linewidth=2)
+
+// Show entry signals
+long_signal_level = low - (atr_value * 0.3)
+short_signal_level = high + (atr_value * 0.3)
+
+plotshape(show_signals and should_have_long_pending ? long_signal_level : na,
+          title="Long Signal", style=shape.triangleup, location=location.absolute,
+          color=color.green, size=size.small, text="L")
+
+plotshape(show_signals and should_have_short_pending ? short_signal_level : na,
+          title="Short Signal", style=shape.triangledown, location=location.absolute,
+          color=color.red, size=size.small, text="S")
+
+// Show pending order levels
+if has_pending_long and show_signals
+    line.new(bar_index, last_long_limit_price, bar_index + 1, last_long_limit_price,
+             color=color.new(color.green, 50), width=1, style=line.style_dotted)
+
+if has_pending_short and show_signals
+    line.new(bar_index, last_short_limit_price, bar_index + 1, last_short_limit_price,
+             color=color.new(color.red, 50), width=1, style=line.style_dotted)
+
+// Debug labels
+bullish_label_level = high + (atr_value * 0.5)
+bearish_label_level = low - (atr_value * 0.5)
+
+if show_debug_labels
+    if ls_flipped_bullish
+        cooldown_text = long_cooldown_active ? "\nCOOLDOWN: " + str.tostring(cooldown_bars - bars_since_long_exit) + " bars left" : ""
+        level_text = use_separate_levels ? "Long Level: " + str.tostring(active_long_level, "#.##") : "EMA: " + str.tostring(ema_value, "#.##")
+        label.new(bar_index, bullish_label_level,
+                  text="LS BULL\n" + level_text +
+                  "\nClose: " + str.tostring(close, "#.##") +
+                  "\nValid: " + (should_have_long_pending ? "YES" : "NO") + cooldown_text,
+                  color=color.green, textcolor=color.white,
+                  style=label.style_label_down, size=size.small)
+
+    if ls_flipped_bearish
+        cooldown_text = short_cooldown_active ? "\nCOOLDOWN: " + str.tostring(cooldown_bars - bars_since_short_exit) + " bars left" : ""
+        level_text = use_separate_levels ? "Short Level: " + str.tostring(active_short_level, "#.##") : "EMA: " + str.tostring(ema_value, "#.##")
+        label.new(bar_index, bearish_label_level,
+                  text="LS BEAR\n" + level_text +
+                  "\nClose: " + str.tostring(close, "#.##") +
+                  "\nValid: " + (should_have_short_pending ? "YES" : "NO") + cooldown_text,
+                  color=color.red, textcolor=color.white,
+                  style=label.style_label_up, size=size.small)
+
+// Mark when entry levels change
+level_changed = (use_separate_levels and (long_level_rounded != long_level_rounded[1] or short_level_rounded != short_level_rounded[1])) or (not use_separate_levels and ema_rounded != ema_rounded[1])
+if show_debug_labels and level_changed and (has_pending_long or has_pending_short)
+    update_text = if use_separate_levels
+        "Long: " + str.tostring(long_level_rounded, "#.##") + " | Short: " + str.tostring(short_level_rounded, "#.##")
+    else
+        "EMA: " + str.tostring(ema_rounded, "#.##")
+
+    label.new(bar_index, math.avg(long_level_rounded, short_level_rounded),
+              text="Level Update: " + update_text,
+              color=color.blue, textcolor=color.white,
+              style=label.style_label_left, size=size.tiny)
+
+// Debug label for spread validation failures
+if show_debug_labels and use_separate_levels and min_spread_points > 0.0 and not spread_valid and (is_bullish or is_bearish)
+    blocked_text = "TRADE BLOCKED\nSpread: " + str.tostring(level_spread, "#.##") + " pts\nMin Required: " + str.tostring(min_spread_points, "#.##") + " pts"
+    label.new(bar_index, high,
+              text=blocked_text,
+              color=color.orange, textcolor=color.white,
+              style=label.style_label_down, size=size.small)
+
+// Debug label for spread-based order cancellations
+if show_debug_labels and use_separate_levels and min_spread_points > 0.0 and not spread_valid and (has_pending_long[1] or has_pending_short[1]) and not (has_pending_long or has_pending_short)
+    cancel_text = "ORDER CANCELLED\nReason: Spread Invalid\nSpread: " + str.tostring(level_spread, "#.##") + " pts\nMin Required: " + str.tostring(min_spread_points, "#.##") + " pts"
+    label.new(bar_index, low,
+              text=cancel_text,
+              color=color.red, textcolor=color.white,
+              style=label.style_label_up, size=size.small)
+
+// ============================================================================
+// DATA WINDOW TRACKING
+// ============================================================================
+
+plotchar(is_bullish ? 1 : 0, title="LS Bullish", char=" ", location=location.top, display=display.data_window)
+plotchar(is_bearish ? 1 : 0, title="LS Bearish", char=" ", location=location.top, display=display.data_window)
+plotchar(use_separate_levels ? 1 : 0, title="Using Separate Levels", char=" ", location=location.top, display=display.data_window)
+plotchar(ema_value, title="Single Level (Raw)", char=" ", location=location.top, display=display.data_window)
+plotchar(ema_rounded, title="Single Level (Rounded)", char=" ", location=location.top, display=display.data_window)
+plotchar(active_long_level, title="Active Long Level", char=" ", location=location.top, display=display.data_window)
+plotchar(long_level_rounded, title="Long Level (Rounded)", char=" ", location=location.top, display=display.data_window)
+plotchar(active_short_level, title="Active Short Level", char=" ", location=location.top, display=display.data_window)
+plotchar(short_level_rounded, title="Short Level (Rounded)", char=" ", location=location.top, display=display.data_window)
+plotchar(level_spread, title="Level Spread (Points)", char=" ", location=location.top, display=display.data_window)
+plotchar(spread_valid ? 1 : 0, title="Spread Valid", char=" ", location=location.top, display=display.data_window)
+plotchar(min_spread_points, title="Min Spread Required", char=" ", location=location.top, display=display.data_window)
+plotchar(current_ls_state == "bullish" ? 1 : current_ls_state == "bearish" ? -1 : 0, title="LS State", char=" ", location=location.top, display=display.data_window)
+plotchar(has_pending_long ? 1 : 0, title="Has Pending Long", char=" ", location=location.top, display=display.data_window)
+plotchar(has_pending_short ? 1 : 0, title="Has Pending Short", char=" ", location=location.top, display=display.data_window)
+plotchar(last_long_limit_price, title="Long Limit Price", char=" ", location=location.top, display=display.data_window)
+plotchar(last_short_limit_price, title="Short Limit Price", char=" ", location=location.top, display=display.data_window)
+plotchar(strategy.position_size, title="Position Size", char=" ", location=location.top, display=display.data_window)
+plotchar(strategy.position_avg_price, title="Avg Entry Price", char=" ", location=location.top, display=display.data_window)
+plotchar(strategy.openprofit, title="Open P&L", char=" ", location=location.top, display=display.data_window)
+plotchar(stop_loss_points, title="Stop Loss (Points)", char=" ", location=location.top, display=display.data_window)
+plotchar(use_trailing_stop ? 1 : 0, title="Trailing Stop Enabled", char=" ", location=location.top, display=display.data_window)
+plotchar(trailing_trigger_points, title="Trail Trigger (Points)", char=" ", location=location.top, display=display.data_window)
+plotchar(trailing_offset_points, title="Trail Offset (Points)", char=" ", location=location.top, display=display.data_window)
+plotchar(enable_cooldown ? 1 : 0, title="Cooldown Enabled", char=" ", location=location.top, display=display.data_window)
+plotchar(cooldown_bars, title="Cooldown Period", char=" ", location=location.top, display=display.data_window)
+plotchar(bars_since_long_exit, title="Bars Since Long Exit", char=" ", location=location.top, display=display.data_window)
+plotchar(bars_since_short_exit, title="Bars Since Short Exit", char=" ", location=location.top, display=display.data_window)
+plotchar(long_cooldown_active ? 1 : 0, title="Long Cooldown Active", char=" ", location=location.top, display=display.data_window)
+plotchar(short_cooldown_active ? 1 : 0, title="Short Cooldown Active", char=" ", location=location.top, display=display.data_window)
+
+// ============================================================================
+// WEBHOOK ALERT LOGIC
+// ============================================================================
+
+// Check if any position closed this bar (still needed to prevent new entries same bar)
+any_position_closed = (strategy.position_size == 0 and strategy.position_size[1] != 0)
+
+// Detect specific alert conditions (don't place new orders on same bar as position close)
+long_place_signal = should_have_long_pending and not has_pending_long[1] and not long_place_alert_sent and not any_position_closed
+short_place_signal = should_have_short_pending and not has_pending_short[1] and not short_place_alert_sent and not any_position_closed
+
+long_update_signal = should_have_long_pending and has_pending_long[1] and last_long_limit_price[1] != long_level_rounded and not long_update_alert_sent
+short_update_signal = should_have_short_pending and has_pending_short[1] and last_short_limit_price[1] != short_level_rounded and not short_update_alert_sent
+
+// Only send cancel if we had a pending order and it wasn't just filled
+long_just_filled = strategy.position_size > 0 and strategy.position_size[1] == 0
+short_just_filled = strategy.position_size < 0 and strategy.position_size[1] == 0
+
+long_cancel_signal = has_pending_long[1] and (not should_have_long_pending or is_bearish) and not long_cancel_alert_sent and not long_just_filled
+short_cancel_signal = has_pending_short[1] and (not should_have_short_pending or is_bullish) and not short_cancel_alert_sent and not short_just_filled
+
+// Position closed events removed - positions should only exit via stops
+
+// Calculate alert message values (all prices rounded to nearest tick)
+long_limit_price = long_level_rounded
+long_stop_price = round_to_tick(long_level_rounded - stop_loss_points)
+
+short_limit_price = short_level_rounded
+short_stop_price = round_to_tick(short_level_rounded + stop_loss_points)
+
+// Long place limit order alert
+if long_place_signal
+    if use_trailing_stop
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(long_limit_price) + ', "stop_loss": ' + str.tostring(long_stop_price) + ', "trailing_trigger": ' + str.tostring(trailing_trigger_points) + ', "trailing_offset": ' + str.tostring(trailing_offset_points) + ', "quantity": 1, "strategy": "LS_EMA"}', alert.freq_once_per_bar)
+    else
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(long_limit_price) + ', "stop_loss": ' + str.tostring(long_stop_price) + ', "quantity": 1, "strategy": "LS_EMA"}', alert.freq_once_per_bar)
+    long_place_alert_sent := true
+    long_cancel_alert_sent := false
+    long_update_alert_sent := false
+
+// Short place limit order alert
+if short_place_signal
+    if use_trailing_stop
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(short_limit_price) + ', "stop_loss": ' + str.tostring(short_stop_price) + ', "trailing_trigger": ' + str.tostring(trailing_trigger_points) + ', "trailing_offset": ' + str.tostring(trailing_offset_points) + ', "quantity": 1, "strategy": "LS_EMA"}', alert.freq_once_per_bar)
+    else
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(short_limit_price) + ', "stop_loss": ' + str.tostring(short_stop_price) + ', "quantity": 1, "strategy": "LS_EMA"}', alert.freq_once_per_bar)
+    short_place_alert_sent := true
+    short_cancel_alert_sent := false
+    short_update_alert_sent := false
+
+// Long update limit order alert (NEW feature)
+if long_update_signal
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "update_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "old_price": ' + str.tostring(last_long_limit_price[1]) + ', "new_price": ' + str.tostring(long_level_rounded) + ', "stop_loss": ' + str.tostring(long_stop_price) + ', "quantity": 1, "strategy": "LS_EMA"}', alert.freq_once_per_bar)
+    long_update_alert_sent := true
+
+// Short update limit order alert (NEW feature)
+if short_update_signal
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "update_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "old_price": ' + str.tostring(last_short_limit_price[1]) + ', "new_price": ' + str.tostring(short_level_rounded) + ', "stop_loss": ' + str.tostring(short_stop_price) + ', "quantity": 1, "strategy": "LS_EMA"}', alert.freq_once_per_bar)
+    short_update_alert_sent := true
+
+// Long cancel limit order alert
+if long_cancel_signal
+    cancel_reason = is_bearish ? "ls_flip" : "conditions_not_met"
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "cancel_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "reason": "' + cancel_reason + '", "quantity": 1, "strategy": "LS_EMA"}', alert.freq_once_per_bar)
+    long_cancel_alert_sent := true
+    long_place_alert_sent := false
+    long_update_alert_sent := false
+
+// Short cancel limit order alert
+if short_cancel_signal
+    cancel_reason = is_bullish ? "ls_flip" : "conditions_not_met"
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "cancel_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "reason": "' + cancel_reason + '", "quantity": 1, "strategy": "LS_EMA"}', alert.freq_once_per_bar)
+    short_cancel_alert_sent := true
+    short_place_alert_sent := false
+    short_update_alert_sent := false
+
+// Position closed alerts removed - positions should only exit via stops/trailing stops
+
+// Reset alert flags when position is filled
+if strategy.position_size > 0 and strategy.position_size[1] == 0
+    long_place_alert_sent := false
+    long_update_alert_sent := false
+    long_cancel_alert_sent := false
+
+if strategy.position_size < 0 and strategy.position_size[1] == 0
+    short_place_alert_sent := false
+    short_update_alert_sent := false
+    short_cancel_alert_sent := false
+
+// Reset update alert flag when bar completes
+if barstate.isconfirmed
+    long_update_alert_sent := false
+    short_update_alert_sent := false

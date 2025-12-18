@@ -1,0 +1,322 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Howitzah
+
+//@version=6
+strategy("Alpha Precision Scalper", overlay=true)
+import Howitzah/common/8 as c
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// LDPS Signal Inputs
+ldps_is_bullish = input.source(title="LDPS Is Bullish", defval=close, group="LDPS Settings")
+ldps_is_bearish = input.source(title="LDPS Is Bearish", defval=close, group="LDPS Settings")
+
+// LT (Liquidity Triggers) Levels - formerly LDPM
+lt_1 = input.source(title="LT Level 1", defval=close, group="LT Settings")
+lt_2 = input.source(title="LT Level 2", defval=close, group="LT Settings")
+lt_3 = input.source(title="LT Level 3", defval=close, group="LT Settings")
+lt_4 = input.source(title="LT Level 4", defval=close, group="LT Settings")
+lt_5 = input.source(title="LT Level 5", defval=close, group="LT Settings")
+
+// Alpha Confluence Settings
+min_lt_confluence = input.int(title="Minimum LT Levels for Confluence", defval=3, minval=2, maxval=5, group="Alpha Settings", tooltip="Number of LT levels required in same direction")
+lt_proximity_points = input.float(title="Max Distance from Nearest LT Level (Points)", defval=3.0, minval=1.0, maxval=10.0, step=0.5, group="Alpha Settings", tooltip="Maximum distance from closest LT level to allow entry")
+
+// Volume Alpha Settings
+volume_spike_multiplier = input.float(title="Volume Spike Multiplier", defval=2.0, minval=1.5, maxval=5.0, step=0.1, group="Volume Alpha", tooltip="Minimum volume as multiple of average for alpha entry")
+volume_period = input.int(title="Volume Lookback Period", defval=20, minval=10, maxval=50, group="Volume Alpha")
+
+// Session Timing (Alpha Hours)
+use_session_filter = input.bool(title="Enable Session Filter", defval=true, group="Session Alpha", tooltip="Only trade during high-alpha time windows")
+morning_start = input.int(title="Morning Session Start (EST)", defval=930, minval=900, maxval=1000, group="Session Alpha")
+morning_end = input.int(title="Morning Session End (EST)", defval=1100, minval=1030, maxval=1200, group="Session Alpha")
+afternoon_start = input.int(title="Afternoon Session Start (EST)", defval=1330, minval=1300, maxval=1400, group="Session Alpha")
+afternoon_end = input.int(title="Afternoon Session End (EST)", defval=1530, minval=1500, maxval=1600, group="Session Alpha")
+
+// Risk Management
+max_stop_loss_points = input.int(title="Maximum Stop Loss (Points)", defval=15, minval=5, maxval=25, group="Risk Management")
+use_dynamic_stops = input.bool(title="Use Dynamic Stops", defval=true, group="Risk Management", tooltip="Use previous candle extremes for stops")
+dynamic_stop_buffer = input.float(title="Dynamic Stop Buffer (Points)", defval=2.0, minval=1.0, maxval=5.0, step=0.5, group="Risk Management")
+
+// Targets and Exits
+target_1_points = input.int(title="Target 1 (Points)", defval=20, minval=10, maxval=50, group="Targets")
+target_2_points = input.int(title="Target 2 (Points)", defval=30, minval=15, maxval=75, group="Targets")
+target_1_percentage = input.float(title="% of Position for Target 1", defval=50.0, minval=25.0, maxval=75.0, step=5.0, group="Targets")
+trailing_start_points = input.int(title="Trailing Start (Points)", defval=15, minval=5, maxval=30, group="Targets", tooltip="Points in profit before trailing starts")
+trailing_offset_points = input.int(title="Trailing Offset (Points)", defval=5, minval=2, maxval=15, group="Targets")
+
+// Time-Based Exits
+max_bars_in_trade = input.int(title="Max Bars in Trade", defval=5, minval=2, maxval=15, group="Time Exits", tooltip="Maximum bars to hold position (quick scalp)")
+
+// Position Control
+allow_long = input.bool(title="Allow Long Positions", defval=true, group="Position Control")
+allow_short = input.bool(title="Allow Short Positions", defval=true, group="Position Control")
+max_trades_per_day = input.int(title="Max Trades Per Day", defval=10, minval=3, maxval=50, group="Position Control")
+
+// Debug and Visualization
+show_debug_info = input.bool(title="Show Debug Info", defval=true, group="Debug")
+show_confluence_lines = input.bool(title="Show Confluence Lines", defval=true, group="Debug")
+
+// ============================================================================
+// LDPS SIGNAL PROCESSING
+// ============================================================================
+
+// Convert LDPS inputs to boolean values
+is_bullish = ldps_is_bullish > 0
+is_bearish = ldps_is_bearish > 0
+
+// Detect clean LDPS flips (not simultaneous bull/bear)
+ldps_flipped_bullish = is_bullish and not is_bullish[1] and not is_bearish
+ldps_flipped_bearish = is_bearish and not is_bearish[1] and not is_bullish
+
+// ============================================================================
+// CONFLUENCE ANALYSIS
+// ============================================================================
+
+// Store all LT levels in array
+lt_levels = array.new<float>()
+array.push(lt_levels, lt_1)
+array.push(lt_levels, lt_2)
+array.push(lt_levels, lt_3)
+array.push(lt_levels, lt_4)
+array.push(lt_levels, lt_5)
+
+// Count confluence levels for bullish setups (levels below price)
+bullish_lt_count = 0
+nearest_support_lt = 0.0
+
+// Remove old ldpm loop - now using consolidated LT levels
+
+for i = 0 to array.size(lt_levels) - 1
+    level = array.get(lt_levels, i)
+    if not na(level) and level < close
+        bullish_lt_count += 1
+        nearest_support_lt := math.max(nearest_support_lt, level)
+
+// Count confluence levels for bearish setups (levels above price)
+bearish_lt_count = 0
+nearest_resistance_lt = 99999.0
+
+// Remove old ldpm loop - now using consolidated LT levels
+
+for i = 0 to array.size(lt_levels) - 1
+    level = array.get(lt_levels, i)
+    if not na(level) and level > close
+        bearish_lt_count += 1
+        nearest_resistance_lt := math.min(nearest_resistance_lt, level)
+
+// Check confluence requirements
+bullish_confluence_met = bullish_lt_count >= min_lt_confluence
+bearish_confluence_met = bearish_lt_count >= min_lt_confluence
+
+// Check proximity to nearest LDPM level
+bullish_proximity_good = math.abs(close - nearest_support_lt) <= lt_proximity_points
+bearish_proximity_good = math.abs(nearest_resistance_lt - close) <= lt_proximity_points and nearest_resistance_lt < 99999
+
+// ============================================================================
+// VOLUME ALPHA FILTER
+// ============================================================================
+
+avg_volume = ta.sma(volume, volume_period)
+volume_spike = volume >= (avg_volume * volume_spike_multiplier)
+
+// ============================================================================
+// SESSION TIMING FILTER
+// ============================================================================
+
+// Convert time to minutes since midnight
+current_time = hour * 100 + minute
+session_active = false
+
+if use_session_filter
+    // Check if in morning alpha session
+    morning_active = current_time >= morning_start and current_time <= morning_end
+    // Check if in afternoon alpha session
+    afternoon_active = current_time >= afternoon_start and current_time <= afternoon_end
+    session_active := morning_active or afternoon_active
+else
+    session_active := true
+
+// ============================================================================
+// ALPHA ENTRY CONDITIONS
+// ============================================================================
+
+// Track daily trade count
+var int daily_trades = 0
+var int last_trade_day = na
+
+// Reset daily trade counter on new day
+if dayofmonth != dayofmonth[1]
+    daily_trades := 0
+    last_trade_day := dayofmonth
+
+// Check if we can take more trades today
+can_trade_today = daily_trades < max_trades_per_day
+
+// Bullish alpha setup
+bullish_alpha_setup = ldps_flipped_bullish and bullish_confluence_met and bullish_proximity_good and volume_spike and session_active and allow_long and can_trade_today and strategy.position_size == 0
+
+// Bearish alpha setup
+bearish_alpha_setup = ldps_flipped_bearish and bearish_confluence_met and bearish_proximity_good and volume_spike and session_active and allow_short and can_trade_today and strategy.position_size == 0
+
+// ============================================================================
+// DYNAMIC RISK CALCULATION
+// ============================================================================
+
+// Calculate dynamic stop levels
+dynamic_long_stop = use_dynamic_stops ? low[1] - dynamic_stop_buffer : close - max_stop_loss_points
+dynamic_short_stop = use_dynamic_stops ? high[1] + dynamic_stop_buffer : close + max_stop_loss_points
+
+// Ensure stops don't exceed maximum risk
+final_long_stop = math.max(dynamic_long_stop, close - max_stop_loss_points)
+final_short_stop = math.min(dynamic_short_stop, close + max_stop_loss_points)
+
+// ============================================================================
+// STRATEGY EXECUTION
+// ============================================================================
+
+// Track entry information
+var float entry_price = na
+var int entry_bar = na
+var float stop_price = na
+var bool target_1_hit = false
+
+// Long entry
+if bullish_alpha_setup
+    strategy.entry("Long", strategy.long)
+    entry_price := close
+    entry_bar := bar_index
+    stop_price := final_long_stop
+    target_1_hit := false
+    daily_trades := daily_trades + 1
+
+// Short entry
+if bearish_alpha_setup
+    strategy.entry("Short", strategy.short)
+    entry_price := close
+    entry_bar := bar_index
+    stop_price := final_short_stop
+    target_1_hit := false
+    daily_trades := daily_trades + 1
+
+// ============================================================================
+// EXIT MANAGEMENT
+// ============================================================================
+
+if strategy.position_size != 0 and not na(entry_price)
+
+    // Calculate bars in trade
+    bars_in_trade = bar_index - entry_bar
+
+    // Calculate current profit in points
+    current_profit_points = 0.0
+    if strategy.position_size > 0  // Long position
+        current_profit_points := close - entry_price
+    else  // Short position
+        current_profit_points := entry_price - close
+
+    // Target 1 (partial exit)
+    if not target_1_hit and current_profit_points >= target_1_points
+        target_1_hit := true
+        position_percent = target_1_percentage / 100
+        strategy.close("Long", qty_percent=position_percent*100, comment="Target 1")
+        strategy.close("Short", qty_percent=position_percent*100, comment="Target 1")
+
+    // Target 2 (remaining position)
+    if current_profit_points >= target_2_points
+        strategy.close_all(comment="Target 2")
+        entry_price := na
+        entry_bar := na
+        target_1_hit := false
+
+    // Stop loss
+    else if (strategy.position_size > 0 and close <= stop_price) or (strategy.position_size < 0 and close >= stop_price)
+        strategy.close_all(comment="Stop Loss")
+        entry_price := na
+        entry_bar := na
+        target_1_hit := false
+
+    // Time-based exit
+    else if bars_in_trade >= max_bars_in_trade
+        strategy.close_all(comment="Time Exit")
+        entry_price := na
+        entry_bar := na
+        target_1_hit := false
+
+    // Trailing stop (after target 1 is hit and remaining position is profitable)
+    else if target_1_hit and current_profit_points >= trailing_start_points
+        if strategy.position_size > 0  // Long trailing
+            trail_stop = high - trailing_offset_points
+            if close <= trail_stop
+                strategy.close_all(comment="Trail Stop")
+                entry_price := na
+                entry_bar := na
+                target_1_hit := false
+        else  // Short trailing
+            trail_stop = low + trailing_offset_points
+            if close >= trail_stop
+                strategy.close_all(comment="Trail Stop")
+                entry_price := na
+                entry_bar := na
+                target_1_hit := false
+
+// Reset tracking variables when position closes
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    entry_price := na
+    entry_bar := na
+    target_1_hit := false
+
+// ============================================================================
+// VISUALIZATION
+// ============================================================================
+
+// Mark alpha setups
+plotshape(bullish_alpha_setup, title="Alpha Long", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.normal, text="α")
+plotshape(bearish_alpha_setup, title="Alpha Short", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.normal, text="α")
+
+// Mark filtered signals
+plotshape(ldps_flipped_bullish and not bullish_confluence_met, title="Low Confluence Long", style=shape.triangleup, location=location.belowbar, color=color.gray, size=size.tiny, text="C")
+plotshape(ldps_flipped_bearish and not bearish_confluence_met, title="Low Confluence Short", style=shape.triangledown, location=location.abovebar, color=color.gray, size=size.tiny, text="C")
+plotshape(ldps_flipped_bullish and not volume_spike, title="Low Volume Long", style=shape.triangleup, location=location.belowbar, color=color.orange, size=size.tiny, text="V")
+plotshape(ldps_flipped_bearish and not volume_spike, title="Low Volume Short", style=shape.triangledown, location=location.abovebar, color=color.orange, size=size.tiny, text="V")
+plotshape(ldps_flipped_bullish and not session_active, title="Outside Session Long", style=shape.triangleup, location=location.belowbar, color=color.yellow, size=size.tiny, text="S")
+plotshape(ldps_flipped_bearish and not session_active, title="Outside Session Short", style=shape.triangledown, location=location.abovebar, color=color.yellow, size=size.tiny, text="S")
+
+// Show confluence levels
+if show_confluence_lines and show_debug_info
+    // Draw LT levels
+    for i = 0 to array.size(lt_levels) - 1
+        level = array.get(lt_levels, i)
+        if not na(level)
+            line_color = level < close ? color.green : color.red
+            line.new(bar_index-5, level, bar_index+5, level, color=line_color, width=1, style=line.style_dotted)
+
+// ============================================================================
+// DATA WINDOW VALUES
+// ============================================================================
+
+plotchar(bullish_lt_count, title="Bullish LT Count", char=" ", location=location.top, display=display.data_window)
+plotchar(bearish_lt_count, title="Bearish LT Count", char=" ", location=location.top, display=display.data_window)
+plotchar(volume_spike ? 1 : 0, title="Volume Spike", char=" ", location=location.top, display=display.data_window)
+plotchar(session_active ? 1 : 0, title="Alpha Session Active", char=" ", location=location.top, display=display.data_window)
+plotchar(daily_trades, title="Daily Trades", char=" ", location=location.top, display=display.data_window)
+plotchar(current_time, title="Current Time", char=" ", location=location.top, display=display.data_window)
+plotchar(nearest_support_lt, title="Nearest Support LT", char=" ", location=location.top, display=display.data_window)
+plotchar(nearest_resistance_lt < 99999 ? nearest_resistance_lt : na, title="Nearest Resistance LT", char=" ", location=location.top, display=display.data_window)
+
+// Debug labels
+if show_debug_info and bullish_alpha_setup
+    label_text = "ALPHA LONG\n" +
+                 "LT: " + str.tostring(bullish_lt_count) + "\n" +
+                 "Vol: " + str.tostring(volume/avg_volume, "#.#") + "x\n" +
+                 "Prox: " + str.tostring(math.abs(close - nearest_support_lt), "#.#") + "pts"
+    label.new(bar_index, low-10, text=label_text, color=color.lime, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+if show_debug_info and bearish_alpha_setup
+    label_text = "ALPHA SHORT\n" +
+                 "LT: " + str.tostring(bearish_lt_count) + "\n" +
+                 "Vol: " + str.tostring(volume/avg_volume, "#.#") + "x\n" +
+                 "Prox: " + str.tostring(math.abs(nearest_resistance_lt - close), "#.#") + "pts"
+    label.new(bar_index, high+10, text=label_text, color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)

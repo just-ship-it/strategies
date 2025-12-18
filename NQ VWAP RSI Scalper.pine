@@ -1,0 +1,328 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Howitzah
+
+//@version=6
+strategy("NQ VWAP RSI Scalper", overlay=true, pyramiding=0, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.cash_per_contract, commission_value=2.5, slippage=2, initial_capital=10000)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// RSI Settings
+rsi_length = input.int(title="RSI Length", defval=7, minval=1, maxval=50, group="RSI Settings", tooltip="Using 7 for smoother RSI, less noise than 3")
+rsi_oversold = input.int(title="RSI Oversold Level", defval=35, minval=1, maxval=49, group="RSI Settings", tooltip="35 gives more signals than 25-30")
+rsi_overbought = input.int(title="RSI Overbought Level", defval=65, minval=51, maxval=99, group="RSI Settings", tooltip="65 gives more signals than 70-75")
+
+// EMA Trend Filter
+use_ema_filter = input.bool(title="Enable EMA Trend Filter", defval=false, group="Trend Filter", tooltip="Currently not used in entry logic")
+ema_length = input.int(title="EMA Length", defval=20, minval=1, maxval=200, group="Trend Filter")
+
+// Liquidity Trend Filter
+use_liquidity_filter = input.bool(title="Enable Liquidity Flip Filter", defval=false, group="Liquidity Filter", tooltip="Avoid trades for X bars after liquidity trend flips")
+ls_is_bullish = input.source(title="LS Is Bullish", defval=close, group="Liquidity Filter", tooltip="Boolean signal from LS indicator (1 = bullish, 0 = bearish)")
+flip_avoidance_bars = input.int(title="Bars to Avoid After LS Flip", defval=5, minval=0, maxval=20, group="Liquidity Filter", tooltip="Number of bars to avoid counter-momentum trades after trend flip")
+
+// ATR Settings
+atr_length = input.int(title="ATR Length", defval=14, minval=1, maxval=50, group="ATR Settings")
+atr_stop_multiplier = input.float(title="ATR Stop Loss Multiplier", defval=1.0, minval=0.1, maxval=5.0, step=0.1, group="ATR Settings")
+atr_target_multiplier = input.float(title="ATR Take Profit Multiplier", defval=2.0, minval=0.1, maxval=10.0, step=0.1, group="ATR Settings")
+
+// Risk Management Settings
+min_stop_loss_points = input.float(title="Minimum Stop Loss (Points)", defval=25.0, minval=1.0, step=1.0, group="Risk Management", tooltip="Minimum stop loss distance, even if ATR suggests less")
+initial_profit_target_points = input.float(title="Initial Profit Target (Points)", defval=100.0, minval=1.0, step=1.0, group="Risk Management")
+
+// Trailing Stop Settings
+use_trailing_stop = input.bool(title="Enable Trailing Stop", defval=false, group="Trailing Stop")
+trailing_trigger_points = input.float(title="Trailing Trigger (Points)", defval=25.0, minval=1.0, step=1.0, group="Trailing Stop", tooltip="Points in profit before trailing stop activates")
+trailing_offset_points = input.float(title="Trailing Offset (Points)", defval=10.0, minval=1.0, step=1.0, group="Trailing Stop", tooltip="Points behind the peak price")
+
+// Visualization
+show_vwap = input.bool(title="Show VWAP", defval=true, group="Visualization")
+show_ema = input.bool(title="Show EMA", defval=true, group="Visualization")
+show_debug_labels = input.bool(title="Show Debug Labels", defval=false, group="Visualization")
+show_condition_dots = input.bool(title="Show Condition Status Dots", defval=true, group="Visualization", tooltip="Shows dots for each condition being met")
+
+// Webhook Settings
+webhook_secret = input.string(title="Webhook Secret", defval="", group="Webhook Settings", tooltip="Secret key for webhook authentication")
+
+// ============================================================================
+// CALCULATIONS
+// ============================================================================
+
+// VWAP calculation
+vwap_value = ta.vwap(hlc3)
+
+// RSI calculation
+rsi_value = ta.rsi(close, rsi_length)
+
+// EMA calculation
+ema_value = ta.ema(close, ema_length)
+
+// ATR calculation
+atr_value = ta.atr(atr_length)
+
+// ============================================================================
+// ENTRY CONDITIONS
+// ============================================================================
+
+// Base conditions
+price_above_vwap = close > vwap_value
+price_below_vwap = close < vwap_value
+price_above_ema = not use_ema_filter or close > ema_value
+price_below_ema = not use_ema_filter or close < ema_value
+rsi_oversold_condition = rsi_value < rsi_oversold
+rsi_overbought_condition = rsi_value > rsi_overbought
+
+// Liquidity trend conditions
+liquidity_is_bullish = ls_is_bullish > 0
+
+// Detect liquidity flips
+ls_flipped_bullish = liquidity_is_bullish and not liquidity_is_bullish[1]
+ls_flipped_bearish = not liquidity_is_bullish and liquidity_is_bullish[1]
+
+// Track bars since each type of flip
+var int bars_since_bullish_flip = na
+var int bars_since_bearish_flip = na
+
+// Update counters
+if ls_flipped_bullish
+    bars_since_bullish_flip := 0
+else if not na(bars_since_bullish_flip)
+    bars_since_bullish_flip += 1
+
+if ls_flipped_bearish
+    bars_since_bearish_flip := 0
+else if not na(bars_since_bearish_flip)
+    bars_since_bearish_flip += 1
+
+// Determine if we should avoid trades due to recent flips
+avoid_shorts_due_to_flip = use_liquidity_filter and not na(bars_since_bullish_flip) and bars_since_bullish_flip < flip_avoidance_bars
+avoid_longs_due_to_flip = use_liquidity_filter and not na(bars_since_bearish_flip) and bars_since_bearish_flip < flip_avoidance_bars
+
+// Allow trades (opposite of avoid)
+allow_longs = not avoid_longs_due_to_flip
+allow_shorts = not avoid_shorts_due_to_flip
+
+// Long entry conditions - Momentum pullback approach
+// Buy when RSI is oversold in an uptrend (price above VWAP) - buying the dip in uptrend
+// Only if liquidity filter allows longs
+long_condition = rsi_oversold_condition and price_above_vwap and allow_longs and strategy.position_size == 0
+
+// Short entry conditions - Momentum pullback approach
+// Sell when RSI is overbought in a downtrend (price below VWAP) - selling the bounce in downtrend
+// Only if liquidity filter allows shorts
+short_condition = rsi_overbought_condition and price_below_vwap and allow_shorts and strategy.position_size == 0
+
+// ============================================================================
+// STRATEGY EXECUTION
+// ============================================================================
+
+// Calculate ATR-based stop and target
+atr_stop_points = atr_value * atr_stop_multiplier / syminfo.mintick / 4  // Convert to points
+atr_target_points = atr_value * atr_target_multiplier / syminfo.mintick / 4  // Convert to points
+
+// Use the larger of ATR-based or minimum stop loss (ensures stop is at least X points)
+actual_stop_points = math.max(atr_stop_points, min_stop_loss_points)
+
+// Use the larger of ATR-based or initial profit target
+actual_target_points = math.max(atr_target_points, initial_profit_target_points)
+
+// Convert points to ticks for strategy.exit
+stop_loss_ticks = actual_stop_points * 4
+profit_target_ticks = actual_target_points * 4
+trailing_trigger_ticks = use_trailing_stop ? trailing_trigger_points * 4 : na
+trailing_offset_ticks = use_trailing_stop ? trailing_offset_points * 4 : na
+
+// Order tracking variables
+var bool has_pending_long = false
+var bool has_pending_short = false
+var int long_order_bar = na
+var int short_order_bar = na
+
+// Cancel unfilled limit orders after 1 bar
+if not na(long_order_bar) and bar_index > long_order_bar
+    strategy.cancel("Long")
+    has_pending_long := false
+    long_order_bar := na
+
+if not na(short_order_bar) and bar_index > short_order_bar
+    strategy.cancel("Short")
+    has_pending_short := false
+    short_order_bar := na
+
+// Clear tracking when orders are filled
+if strategy.position_size > 0 and strategy.position_size[1] <= 0
+    has_pending_long := false
+    long_order_bar := na
+
+if strategy.position_size < 0 and strategy.position_size[1] >= 0
+    has_pending_short := false
+    short_order_bar := na
+
+// Only allow new entries when flat and no pending orders
+is_flat = strategy.position_size == 0
+
+// Long entry with limit order at close
+if long_condition and is_flat and not has_pending_long
+    // Cancel any pending short order
+    if has_pending_short
+        strategy.cancel("Short")
+        has_pending_short := false
+        short_order_bar := na
+
+    strategy.entry("Long", strategy.long, limit=close)
+    has_pending_long := true
+    long_order_bar := bar_index
+
+    if use_trailing_stop
+        strategy.exit("Long Exit", "Long", loss=stop_loss_ticks, profit=profit_target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else
+        strategy.exit("Long Exit", "Long", loss=stop_loss_ticks, profit=profit_target_ticks)
+
+// Short entry with limit order at close
+if short_condition and is_flat and not has_pending_short
+    // Cancel any pending long order
+    if has_pending_long
+        strategy.cancel("Long")
+        has_pending_long := false
+        long_order_bar := na
+
+    strategy.entry("Short", strategy.short, limit=close)
+    has_pending_short := true
+    short_order_bar := bar_index
+
+    if use_trailing_stop
+        strategy.exit("Short Exit", "Short", loss=stop_loss_ticks, profit=profit_target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else
+        strategy.exit("Short Exit", "Short", loss=stop_loss_ticks, profit=profit_target_ticks)
+
+// ============================================================================
+// VISUALIZATION
+// ============================================================================
+
+// Plot VWAP
+plot(show_vwap ? vwap_value : na, title="VWAP", color=color.blue, linewidth=2)
+
+// Plot EMA
+plot(show_ema and use_ema_filter ? ema_value : na, title="EMA", color=color.orange, linewidth=1)
+
+// Plot entry signals
+plotshape(long_condition, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="L")
+plotshape(short_condition, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="S")
+
+// Diagnostic dots to show which conditions are met
+// Always show price position relative to VWAP
+bgcolor(show_condition_dots and price_above_vwap ? color.new(color.green, 95) : na, title="Above VWAP Background")
+bgcolor(show_condition_dots and price_below_vwap ? color.new(color.red, 95) : na, title="Below VWAP Background")
+
+// Show the actual conditions we're checking for entries
+plotshape(show_condition_dots and rsi_oversold_condition, title="RSI Oversold", style=shape.circle, location=location.bottom, color=color.new(color.lime, 50), size=size.small)
+plotshape(show_condition_dots and rsi_overbought_condition, title="RSI Overbought", style=shape.circle, location=location.top, color=color.new(color.red, 50), size=size.small)
+
+// Show when actual entry conditions are met
+plotshape(show_condition_dots and long_condition, title="Long Condition Met", style=shape.diamond, location=location.bottom, color=color.lime, size=size.normal)
+plotshape(show_condition_dots and short_condition, title="Short Condition Met", style=shape.diamond, location=location.top, color=color.red, size=size.normal)
+
+// Debug labels
+if show_debug_labels and (long_condition or short_condition)
+    label_text = "RSI: " + str.tostring(rsi_value, "#.##") + "\nVWAP: " + str.tostring(vwap_value, "#.##") + "\nClose: " + str.tostring(close, "#.##") + "\nATR: " + str.tostring(atr_value, "#.##") + "\nStop: " + str.tostring(actual_stop_points, "#.#") + " pts" + "\nTarget: " + str.tostring(actual_target_points, "#.#") + " pts"
+
+    label.new(bar_index, long_condition ? low - atr_value : high + atr_value, text=label_text, color=long_condition ? color.green : color.red, textcolor=color.white, style=long_condition ? label.style_label_up : label.style_label_down, size=size.small)
+
+// ============================================================================
+// DATA WINDOW TRACKING
+// ============================================================================
+
+plotchar(rsi_value, title="RSI Value", char=" ", location=location.top, display=display.data_window)
+plotchar(rsi_oversold, title="RSI Oversold Level", char=" ", location=location.top, display=display.data_window)
+plotchar(rsi_overbought, title="RSI Overbought Level", char=" ", location=location.top, display=display.data_window)
+plotchar(vwap_value, title="VWAP Value", char=" ", location=location.top, display=display.data_window)
+plotchar(ema_value, title="EMA Value", char=" ", location=location.top, display=display.data_window)
+plotchar(atr_value, title="ATR Value", char=" ", location=location.top, display=display.data_window)
+plotchar(price_above_vwap ? 1 : 0, title="Price Above VWAP", char=" ", location=location.top, display=display.data_window)
+plotchar(price_above_ema ? 1 : 0, title="Price Above EMA", char=" ", location=location.top, display=display.data_window)
+plotchar(rsi_oversold_condition ? 1 : 0, title="RSI Oversold", char=" ", location=location.top, display=display.data_window)
+plotchar(rsi_overbought_condition ? 1 : 0, title="RSI Overbought", char=" ", location=location.top, display=display.data_window)
+plotchar(actual_stop_points, title="Actual Stop (Points)", char=" ", location=location.top, display=display.data_window)
+plotchar(actual_target_points, title="Actual Target (Points)", char=" ", location=location.top, display=display.data_window)
+plotchar(strategy.position_size, title="Position Size", char=" ", location=location.top, display=display.data_window)
+plotchar(strategy.position_avg_price, title="Avg Entry Price", char=" ", location=location.top, display=display.data_window)
+plotchar(strategy.openprofit, title="Open P&L", char=" ", location=location.top, display=display.data_window)
+plotchar(use_trailing_stop ? 1 : 0, title="Trailing Stop Enabled", char=" ", location=location.top, display=display.data_window)
+plotchar(trailing_trigger_points, title="Trail Trigger (Points)", char=" ", location=location.top, display=display.data_window)
+plotchar(trailing_offset_points, title="Trail Offset (Points)", char=" ", location=location.top, display=display.data_window)
+plotchar(use_liquidity_filter ? 1 : 0, title="Liquidity Filter Enabled", char=" ", location=location.top, display=display.data_window)
+plotchar(liquidity_is_bullish ? 1 : 0, title="Liquidity Is Bullish", char=" ", location=location.top, display=display.data_window)
+plotchar(ls_flipped_bullish ? 1 : 0, title="LS Flipped Bullish", char=" ", location=location.top, display=display.data_window)
+plotchar(ls_flipped_bearish ? 1 : 0, title="LS Flipped Bearish", char=" ", location=location.top, display=display.data_window)
+plotchar(bars_since_bullish_flip, title="Bars Since Bullish Flip", char=" ", location=location.top, display=display.data_window)
+plotchar(bars_since_bearish_flip, title="Bars Since Bearish Flip", char=" ", location=location.top, display=display.data_window)
+plotchar(flip_avoidance_bars, title="Flip Avoidance Bars Setting", char=" ", location=location.top, display=display.data_window)
+plotchar(avoid_longs_due_to_flip ? 1 : 0, title="Avoiding Longs Due To Flip", char=" ", location=location.top, display=display.data_window)
+plotchar(avoid_shorts_due_to_flip ? 1 : 0, title="Avoiding Shorts Due To Flip", char=" ", location=location.top, display=display.data_window)
+plotchar(allow_longs ? 1 : 0, title="Allow Longs", char=" ", location=location.top, display=display.data_window)
+plotchar(allow_shorts ? 1 : 0, title="Allow Shorts", char=" ", location=location.top, display=display.data_window)
+plotchar(has_pending_long ? 1 : 0, title="Has Pending Long", char=" ", location=location.top, display=display.data_window)
+plotchar(has_pending_short ? 1 : 0, title="Has Pending Short", char=" ", location=location.top, display=display.data_window)
+plotchar(long_order_bar, title="Long Order Bar", char=" ", location=location.top, display=display.data_window)
+plotchar(short_order_bar, title="Short Order Bar", char=" ", location=location.top, display=display.data_window)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+// Track alert conditions
+long_limit_placed = long_condition and is_flat and not has_pending_long
+short_limit_placed = short_condition and is_flat and not has_pending_short
+
+// Order cancellation alerts
+long_order_cancelled = not na(long_order_bar[1]) and na(long_order_bar) and strategy.position_size <= 0
+short_order_cancelled = not na(short_order_bar[1]) and na(short_order_bar) and strategy.position_size >= 0
+
+// Position closed alerts
+long_position_closed = strategy.position_size == 0 and strategy.position_size[1] > 0
+short_position_closed = strategy.position_size == 0 and strategy.position_size[1] < 0
+
+// Calculate actual stop and target prices for alerts
+long_limit_price = close
+long_stop_price = close - actual_stop_points
+long_target_price = close + actual_target_points
+short_limit_price = close
+short_stop_price = close + actual_stop_points
+short_target_price = close - actual_target_points
+
+// Long limit order placed alert
+if long_limit_placed
+    alert_msg = '{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(long_limit_price) + ', "stop_loss": ' + str.tostring(long_stop_price) + ', "take_profit": ' + str.tostring(long_target_price)
+
+    if use_trailing_stop
+        alert_msg := alert_msg + ', "trailing_trigger": ' + str.tostring(trailing_trigger_points) + ', "trailing_offset": ' + str.tostring(trailing_offset_points)
+
+    alert_msg := alert_msg + ', "quantity": 1, "strategy": "NQ_VWAP_RSI"}'
+
+    alert(alert_msg, alert.freq_once_per_bar)
+
+// Short limit order placed alert
+if short_limit_placed
+    alert_msg = '{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(short_limit_price) + ', "stop_loss": ' + str.tostring(short_stop_price) + ', "take_profit": ' + str.tostring(short_target_price)
+
+    if use_trailing_stop
+        alert_msg := alert_msg + ', "trailing_trigger": ' + str.tostring(trailing_trigger_points) + ', "trailing_offset": ' + str.tostring(trailing_offset_points)
+
+    alert_msg := alert_msg + ', "quantity": 1, "strategy": "NQ_VWAP_RSI"}'
+
+    alert(alert_msg, alert.freq_once_per_bar)
+
+// Order cancellation alerts
+if long_order_cancelled
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "cancel_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "reason": "expired", "quantity": 1, "strategy": "NQ_VWAP_RSI"}', alert.freq_once_per_bar)
+
+if short_order_cancelled
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "cancel_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "reason": "expired", "quantity": 1, "strategy": "NQ_VWAP_RSI"}', alert.freq_once_per_bar)
+
+// Position closed alerts
+if long_position_closed
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "position_closed", "side": "long", "symbol": "' + syminfo.ticker + '", "exit_price": ' + str.tostring(close) + ', "strategy": "NQ_VWAP_RSI"}', alert.freq_once_per_bar)
+
+if short_position_closed
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "position_closed", "side": "short", "symbol": "' + syminfo.ticker + '", "exit_price": ' + str.tostring(close) + ', "strategy": "NQ_VWAP_RSI"}', alert.freq_once_per_bar)

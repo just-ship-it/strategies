@@ -1,0 +1,710 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Howitzah
+
+//@version=6
+strategy("Optimal Entry Scalper", overlay=true)
+import Howitzah/common/8 as c
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// LDPS Signal Inputs
+ldps_is_bullish = input.source(title="LDPS Is Bullish", defval=close, group="Signal Inputs")
+ldps_is_bearish = input.source(title="LDPS Is Bearish", defval=close, group="Signal Inputs")
+
+// LT (Liquidity Triggers) Levels
+lt_1 = input.source(title="LT Level 1", defval=close, group="LT Levels")
+lt_2 = input.source(title="LT Level 2", defval=close, group="LT Levels")
+lt_3 = input.source(title="LT Level 3", defval=close, group="LT Levels")
+lt_4 = input.source(title="LT Level 4", defval=close, group="LT Levels")
+lt_5 = input.source(title="LT Level 5", defval=close, group="LT Levels")
+
+// Trigger Levels (Additional confirmation from external indicator)
+trigger_1 = input.source(title="Trigger Level 1", defval=close, group="Trigger Levels")
+trigger_2 = input.source(title="Trigger Level 2", defval=close, group="Trigger Levels")
+
+// Phase 1: Market Condition Assessment
+min_lt_stack = input.int(title="Min LT Levels for Direction Confirmation", defval=2, minval=1, maxval=5, group="Market Assessment", tooltip="Number of LT levels required to confirm LDPS direction")
+min_trigger_levels = input.int(title="Min Trigger Levels Required", defval=0, minval=0, maxval=2, group="Market Assessment", tooltip="Number of trigger levels required (0 = disabled)")
+
+// Phase 2: Confluence Factors (Optional)
+use_volume_filter = input.bool(title="Enable Volume Filter", defval=true, group="Confluence Filters")
+volume_multiplier = input.float(title="Volume Spike Multiplier", defval=2.0, minval=1.0, step=0.1, group="Confluence Filters")
+volume_period = input.int(title="Volume Period", defval=20, minval=5, group="Confluence Filters")
+
+use_proximity_filter = input.bool(title="Enable LT Proximity Filter", defval=true, group="Confluence Filters")
+max_lt_distance = input.float(title="Max Distance to LT Level (Points)", defval=5.0, minval=0.0, step=1.0, group="Confluence Filters", tooltip="Maximum distance from nearest LT level")
+
+use_session_filter = input.bool(title="Enable Session Filter", defval=false, group="Confluence Filters")
+session_start_1 = input.int(title="Session 1 Start (HHMM)", defval=930, group="Confluence Filters")
+session_end_1 = input.int(title="Session 1 End (HHMM)", defval=1100, group="Confluence Filters")
+session_start_2 = input.int(title="Session 2 Start (HHMM)", defval=1330, group="Confluence Filters")
+session_end_2 = input.int(title="Session 2 End (HHMM)", defval=1530, group="Confluence Filters")
+
+// Phase 3: Optimal Entry Settings
+entry_buffer_points = input.float(title="Entry Buffer Points", defval=1.0, minval=-10.0, maxval=10.0, step=1.0, group="Entry Logic", tooltip="Points away from LT level for limit order (negative = more aggressive)")
+order_expiry_bars = input.int(title="Order Expiry (Bars)", defval=3, minval=1, group="Entry Logic", tooltip="Bars to keep limit order active")
+
+// Phase 4: Risk Management (All Optional)
+use_stop_loss = input.bool(title="Enable Stop Loss", defval=true, group="Risk Management")
+stop_loss_type = input.string(title="Stop Loss Type", defval="Dynamic", options=["Fixed Points", "Dynamic"], group="Risk Management")
+fixed_stop_points = input.float(title="Fixed Stop Loss (Points)", defval=15.0, minval=1.0, step=1.0, group="Risk Management")
+dynamic_stop_buffer = input.float(title="Dynamic Stop Buffer (Points)", defval=3.0, minval=0.0, step=1.0, group="Risk Management")
+max_stop_loss_points = input.float(title="Maximum Stop Loss (Points)", defval=25.0, minval=1.0, step=1.0, group="Risk Management", tooltip="Safety cap for dynamic stops")
+
+use_take_profit = input.bool(title="Enable Take Profit", defval=true, group="Risk Management")
+target_points = input.float(title="Target (Points)", defval=20.0, minval=1.0, step=1.0, group="Risk Management")
+
+use_trailing_stop = input.bool(title="Enable Trailing Stop", defval=false, group="Trailing Stop")
+trailing_trigger_points = input.float(title="Trailing Trigger (Points)", defval=15.0, minval=1.0, step=1.0, group="Trailing Stop")
+trailing_offset_points = input.float(title="Trailing Offset (Points)", defval=5.0, minval=1.0, step=1.0, group="Trailing Stop")
+
+use_time_exit = input.bool(title="Enable Time-Based Exit", defval=false, group="Time Management")
+max_bars_in_trade = input.int(title="Max Bars in Trade", defval=10, minval=1, group="Time Management")
+
+// Timezone Management
+timezone_offset_hours = input.int(title="Timezone Offset to Exchange", defval=-1, minval=-12, maxval=12, group="Time Management", tooltip="Hours to add to your local time to convert to exchange time (EST to CT = -1, EST is 1 hour ahead)")
+
+// End of Day Management
+use_eod_close = input.bool(title="Enable End-of-Day Close", defval=true, group="Time Management")
+eod_close_time = input.int(title="EOD Close Time (HHMM)", defval=1540, group="Time Management", tooltip="Time to force close all positions (enter in your local timezone)")
+eod_stop_new_trades_time = input.int(title="Stop New Trades Time (HHMM)", defval=1530, group="Time Management", tooltip="Time to stop accepting new trades (enter in your local timezone)")
+
+// Position Controls
+allow_long = input.bool(title="Allow Long Trades", defval=true, group="Position Control")
+allow_short = input.bool(title="Allow Short Trades", defval=true, group="Position Control")
+
+// Debug and Visualization
+show_decision_tree = input.bool(title="Show Decision Tree Labels", defval=true, group="Debug")
+
+// Webhook Settings
+webhook_secret = input.string(title="Webhook Secret", defval="OptimalEntry", group="Webhook Settings", tooltip="Secret key for webhook authentication")
+
+// ============================================================================
+// TIMEZONE CONVERSION FUNCTION
+// ============================================================================
+
+// Convert local time (HHMM) to exchange time by adding offset hours
+convertTimeToExchange(localTime, offsetHours) =>
+    localHour = math.floor(localTime / 100)
+    localMinute = localTime % 100
+
+    // Add offset hours
+    exchangeHour = localHour + offsetHours
+
+    // Handle hour boundaries (0-23)
+    while exchangeHour >= 24
+        exchangeHour := exchangeHour - 24
+    while exchangeHour < 0
+        exchangeHour := exchangeHour + 24
+
+    // Convert back to HHMM format
+    exchangeHour * 100 + localMinute
+
+// ============================================================================
+// PHASE 1: MARKET CONDITION ASSESSMENT
+// ============================================================================
+
+// Convert LDPS signals to booleans
+is_bullish_signal = ldps_is_bullish > 0
+is_bearish_signal = ldps_is_bearish > 0
+
+// Store LT levels in array
+lt_levels = array.new<float>()
+array.push(lt_levels, lt_1)
+array.push(lt_levels, lt_2)
+array.push(lt_levels, lt_3)
+array.push(lt_levels, lt_4)
+array.push(lt_levels, lt_5)
+
+// Store Trigger levels in array
+trigger_levels = array.new<float>()
+array.push(trigger_levels, trigger_1)
+array.push(trigger_levels, trigger_2)
+
+// Count LT levels that confirm direction
+lt_support_count = 0
+lt_resistance_count = 0
+nearest_support_lt = 0.0
+nearest_resistance_lt = 99999.0
+
+// Count Trigger levels that confirm direction
+trigger_support_count = 0
+trigger_resistance_count = 0
+
+for i = 0 to array.size(lt_levels) - 1
+    level = array.get(lt_levels, i)
+    if not na(level)
+        if level < close
+            lt_support_count += 1
+            nearest_support_lt := math.max(nearest_support_lt, level)
+        else if level > close
+            lt_resistance_count += 1
+            nearest_resistance_lt := math.min(nearest_resistance_lt, level)
+
+// Count trigger levels above and below price
+for i = 0 to array.size(trigger_levels) - 1
+    level = array.get(trigger_levels, i)
+    if not na(level)
+        if level < close
+            trigger_support_count += 1
+        else if level > close
+            trigger_resistance_count += 1
+
+// Phase 1 Decision: Market Bias Confirmed?
+// For longs: Need trigger levels below (support) if min_trigger_levels > 0
+// For shorts: Need trigger levels above (resistance) if min_trigger_levels > 0
+trigger_long_met = min_trigger_levels == 0 ? true : trigger_support_count >= min_trigger_levels
+trigger_short_met = min_trigger_levels == 0 ? true : trigger_resistance_count >= min_trigger_levels
+
+long_bias_confirmed = is_bullish_signal and lt_support_count >= min_lt_stack and trigger_long_met and allow_long
+short_bias_confirmed = is_bearish_signal and lt_resistance_count >= min_lt_stack and trigger_short_met and allow_short
+market_bias = long_bias_confirmed ? "LONG" : short_bias_confirmed ? "SHORT" : "NO_TRADE"
+
+// ============================================================================
+// PHASE 2: CONFLUENCE FILTERS
+// ============================================================================
+
+// Volume Filter
+volume_spike_met = true
+if use_volume_filter
+    avg_volume = ta.sma(volume, volume_period)
+    volume_spike_met := volume >= (avg_volume * volume_multiplier)
+
+// Proximity Filter
+proximity_met = true
+if use_proximity_filter
+    if long_bias_confirmed
+        distance_to_support = math.abs(close - nearest_support_lt)
+        proximity_met := distance_to_support <= max_lt_distance
+    else if short_bias_confirmed
+        distance_to_resistance = math.abs(nearest_resistance_lt - close)
+        proximity_met := distance_to_resistance <= max_lt_distance and nearest_resistance_lt < 99999
+
+// Calculate current time (used by session filter and optionally by EOD)
+current_time = hour * 100 + minute
+
+// Calculate bar close time ONLY when EOD close is enabled
+var int bar_close_time = na
+if use_eod_close
+    // For EOD close, we need to check if the CLOSE of this bar will be past EOD time
+    // Calculate when this bar will close
+    bar_close_hour = hour
+    bar_close_minute = minute + timeframe.multiplier
+    if timeframe.isminutes
+        while bar_close_minute >= 60
+            bar_close_minute := bar_close_minute - 60
+            bar_close_hour := bar_close_hour + 1
+    bar_close_time := bar_close_hour * 100 + bar_close_minute
+
+// Session Filter
+session_active = true
+if use_session_filter
+    session_1_active = current_time >= session_start_1 and current_time <= session_end_1
+    session_2_active = current_time >= session_start_2 and current_time <= session_end_2
+    session_active := session_1_active or session_2_active
+
+// End of Day Filter
+new_trades_allowed = true
+if use_eod_close and not na(bar_close_time)
+    // Convert local EOD time to exchange time
+    exchange_eod_stop_new_trades_time = convertTimeToExchange(eod_stop_new_trades_time, timezone_offset_hours)
+    // Don't allow new trades if the bar close time would extend past stop time
+    new_trades_allowed := bar_close_time <= exchange_eod_stop_new_trades_time
+
+// Phase 2 Decision: All Confluence Met?
+all_confluence_met = volume_spike_met and proximity_met and session_active and new_trades_allowed
+
+// ============================================================================
+// PHASE 3: OPTIMAL ENTRY LOGIC (LIMIT ORDERS ONLY)
+// ============================================================================
+
+// Track pending orders
+var float pending_long_price = na
+var float pending_short_price = na
+var int long_order_bar = na
+var int short_order_bar = na
+var string long_signal_time_str = na
+var string short_signal_time_str = na
+
+// Calculate optimal entry prices and round to nearest tick
+optimal_long_entry = math.round_to_mintick(nearest_support_lt + entry_buffer_points)
+optimal_short_entry = math.round_to_mintick(nearest_resistance_lt - entry_buffer_points)
+
+// Cancel opposing orders when bias changes
+var string previous_market_bias = na
+if market_bias != previous_market_bias and strategy.position_size == 0
+    if market_bias == "LONG" and not na(pending_short_price)
+        strategy.cancel("Short")
+        pending_short_price := na
+        short_order_bar := na
+        short_signal_time_str := na
+    else if market_bias == "SHORT" and not na(pending_long_price)
+        strategy.cancel("Long")
+        pending_long_price := na
+        long_order_bar := na
+        long_signal_time_str := na
+    else if market_bias == "NO_TRADE"
+        strategy.cancel_all()
+        pending_long_price := na
+        pending_short_price := na
+        long_order_bar := na
+        short_order_bar := na
+        long_signal_time_str := na
+        short_signal_time_str := na
+    previous_market_bias := market_bias
+
+// Calculate tick values for exit strategies (needed in entry blocks)
+float target_ticks = use_take_profit ? target_points * 4 : na
+// Always calculate trailing parameters when enabled (never pass NA to strategy.exit)
+float trailing_trigger_ticks = trailing_trigger_points * 4
+float trailing_offset_ticks = trailing_offset_points * 4
+
+// Entry conditions with additional safety checks
+should_place_long_order = market_bias == "LONG" and all_confluence_met and strategy.position_size == 0 and na(pending_long_price) and na(pending_short_price)
+should_place_short_order = market_bias == "SHORT" and all_confluence_met and strategy.position_size == 0 and na(pending_short_price) and na(pending_long_price)
+
+// Place limit orders at optimal levels
+if should_place_long_order
+    long_signal_time_str := str.format_time(time, "yyyy-MM-dd HH:mm", "America/New_York")
+    strategy.entry("Long", strategy.long, limit=optimal_long_entry, comment=long_signal_time_str)
+    pending_long_price := optimal_long_entry
+    long_order_bar := bar_index
+
+    // Calculate stop loss for long entry
+    float long_stop_ticks = na
+    string long_stop_type = na
+    if use_stop_loss
+        if stop_loss_type == "Fixed Points"
+            long_stop_ticks := fixed_stop_points * 4
+            long_stop_type := "Fixed"
+        else  // Dynamic with fallback logic
+            // Check if nearest support LT is valid
+            if nearest_support_lt > 0 and nearest_support_lt < optimal_long_entry
+                // Valid LT level - use dynamic calculation
+                float calculated_stop_long = (optimal_long_entry - (nearest_support_lt - dynamic_stop_buffer)) * 4
+                long_stop_ticks := math.min(calculated_stop_long, max_stop_loss_points * 4)  // Cap at maximum
+                long_stop_type := "Dynamic-LT"
+            else
+                // Invalid LT level - fallback to fixed stop
+                long_stop_ticks := fixed_stop_points * 4
+                long_stop_type := "Dynamic-Fallback"
+
+    // Set exit strategy immediately after entry
+    if use_trailing_stop and use_stop_loss and use_take_profit
+        strategy.exit("Long Exit", "Long", loss=long_stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else if use_trailing_stop and use_stop_loss
+        strategy.exit("Long Exit", "Long", loss=long_stop_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else if use_trailing_stop and use_take_profit
+        strategy.exit("Long Exit", "Long", profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else if use_trailing_stop
+        strategy.exit("Long Exit", "Long", trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else if use_stop_loss and use_take_profit
+        strategy.exit("Long Exit", "Long", loss=long_stop_ticks, profit=target_ticks)
+    else if use_stop_loss
+        strategy.exit("Long Exit", "Long", loss=long_stop_ticks)
+    else if use_take_profit
+        strategy.exit("Long Exit", "Long", profit=target_ticks)
+
+if should_place_short_order
+    short_signal_time_str := str.format_time(time, "yyyy-MM-dd HH:mm", "America/New_York")
+    strategy.entry("Short", strategy.short, limit=optimal_short_entry, comment=short_signal_time_str)
+    pending_short_price := optimal_short_entry
+    short_order_bar := bar_index
+
+    // Calculate stop loss for short entry
+    float short_stop_ticks = na
+    string short_stop_type = na
+    if use_stop_loss
+        if stop_loss_type == "Fixed Points"
+            short_stop_ticks := fixed_stop_points * 4
+            short_stop_type := "Fixed"
+        else  // Dynamic with fallback logic
+            // Check if nearest resistance LT is valid
+            if nearest_resistance_lt > 0 and nearest_resistance_lt > optimal_short_entry
+                // Valid LT level - use dynamic calculation
+                float calculated_stop_short = ((nearest_resistance_lt + dynamic_stop_buffer) - optimal_short_entry) * 4
+                short_stop_ticks := math.min(calculated_stop_short, max_stop_loss_points * 4)  // Cap at maximum
+                short_stop_type := "Dynamic-LT"
+            else
+                // Invalid LT level - fallback to fixed stop
+                short_stop_ticks := fixed_stop_points * 4
+                short_stop_type := "Dynamic-Fallback"
+
+    // Set exit strategy immediately after entry
+    if use_trailing_stop and use_stop_loss and use_take_profit
+        strategy.exit("Short Exit", "Short", loss=short_stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else if use_trailing_stop and use_stop_loss
+        strategy.exit("Short Exit", "Short", loss=short_stop_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else if use_trailing_stop and use_take_profit
+        strategy.exit("Short Exit", "Short", profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else if use_trailing_stop
+        strategy.exit("Short Exit", "Short", trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else if use_stop_loss and use_take_profit
+        strategy.exit("Short Exit", "Short", loss=short_stop_ticks, profit=target_ticks)
+    else if use_stop_loss
+        strategy.exit("Short Exit", "Short", loss=short_stop_ticks)
+    else if use_take_profit
+        strategy.exit("Short Exit", "Short", profit=target_ticks)
+
+// Cancel expired orders
+if not na(pending_long_price) and bar_index - long_order_bar >= order_expiry_bars and strategy.position_size == 0
+    strategy.cancel("Long")
+    pending_long_price := na
+    long_order_bar := na
+    long_signal_time_str := na
+
+if not na(pending_short_price) and bar_index - short_order_bar >= order_expiry_bars and strategy.position_size == 0
+    strategy.cancel("Short")
+    pending_short_price := na
+    short_order_bar := na
+    short_signal_time_str := na
+
+// Clear ALL pending orders when ANY position opens (prevents opposite order from filling)
+if strategy.position_size > 0 and strategy.position_size[1] == 0
+    pending_long_price := na
+    pending_short_price := na
+    long_order_bar := na
+    short_order_bar := na
+    long_signal_time_str := na
+    short_signal_time_str := na
+    // Cancel any remaining pending short orders
+    strategy.cancel("Short")
+
+if strategy.position_size < 0 and strategy.position_size[1] == 0
+    pending_long_price := na
+    pending_short_price := na
+    long_order_bar := na
+    short_order_bar := na
+    long_signal_time_str := na
+    short_signal_time_str := na
+    // Cancel any remaining pending long orders
+    strategy.cancel("Long")
+
+// ============================================================================
+// PHASE 4: FLEXIBLE RISK MANAGEMENT
+// ============================================================================
+
+// Track position info
+var float entry_price = na
+var int entry_bar = na
+var float stop_price = na
+
+// Debug variables for stop type used
+var string stop_type_used_long = na
+var string stop_type_used_short = na
+
+// Set entry info when position opens
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    entry_price := strategy.position_avg_price
+    entry_bar := bar_index
+
+    // Update debug variables for stop type tracking
+    if strategy.position_size > 0
+        stop_type_used_long := stop_loss_type == "Fixed Points" ? "Fixed" : (nearest_support_lt > 0 and nearest_support_lt < entry_price ? "Dynamic-LT" : "Dynamic-Fallback")
+    else
+        stop_type_used_short := stop_loss_type == "Fixed Points" ? "Fixed" : (nearest_resistance_lt > 0 and nearest_resistance_lt > entry_price ? "Dynamic-LT" : "Dynamic-Fallback")
+
+    // Calculate stop loss
+    if use_stop_loss
+        if stop_loss_type == "Fixed Points"
+            if strategy.position_size > 0
+                stop_price := entry_price - fixed_stop_points
+            else
+                stop_price := entry_price + fixed_stop_points
+        else  // Dynamic stop
+            if strategy.position_size > 0
+                stop_price := nearest_support_lt - dynamic_stop_buffer
+            else
+                stop_price := nearest_resistance_lt + dynamic_stop_buffer
+
+
+
+
+
+// Time-based exit (only if enabled and no other exit methods active)
+if use_time_exit and not na(entry_bar) and strategy.position_size != 0
+    bars_in_trade = bar_index - entry_bar
+    if bars_in_trade >= max_bars_in_trade
+        strategy.close_all(comment="Time Exit")
+        entry_price := na
+        entry_bar := na
+
+// End of Day close - force close all positions and cancel pending orders
+var bool eod_close_triggered = false
+var bool pending_orders_cancelled = false
+var int eod_close_attempt_count = 0
+
+// Check if we're past EOD close time
+is_past_eod_close = false
+if use_eod_close
+    // Convert local EOD close time to exchange time
+    exchange_eod_close_time = convertTimeToExchange(eod_close_time, timezone_offset_hours)
+
+    // Primary check: current time has reached EOD close time
+    time_based_close = current_time >= exchange_eod_close_time
+
+    // Secondary check: for non-1min charts, also check if bar close would exceed EOD
+    bar_based_close = not na(bar_close_time) and bar_close_time > exchange_eod_close_time
+
+    is_past_eod_close := time_based_close or bar_based_close
+
+if is_past_eod_close
+    // Cancel all pending orders
+    strategy.cancel_all()
+    pending_orders_cancelled := true
+
+    // Force close any open positions - try multiple methods
+    if strategy.position_size != 0
+        eod_close_attempt_count := eod_close_attempt_count + 1
+
+        // Try close_all first
+        strategy.close_all(comment="EOD Close")
+
+        // Also try individual position closes as backup
+        if strategy.position_size > 0
+            strategy.close("Long", comment="EOD Close")
+        if strategy.position_size < 0
+            strategy.close("Short", comment="EOD Close")
+
+        // Reset position tracking
+        entry_price := na
+        entry_bar := na
+        eod_close_triggered := true
+
+        // Clear any pending orders that might have been placed
+        pending_long_price := na
+        pending_short_price := na
+        long_order_bar := na
+        short_order_bar := na
+else
+    eod_close_triggered := false
+    pending_orders_cancelled := false
+    eod_close_attempt_count := 0
+
+// Reset when position fully closes
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    entry_price := na
+    entry_bar := na
+
+// ============================================================================
+// WEBHOOK ALERTS
+// ============================================================================
+
+// Track alert states to avoid duplicates
+var bool long_limit_alert_sent = false
+var bool short_limit_alert_sent = false
+var bool long_cancel_alert_sent = false
+var bool short_cancel_alert_sent = false
+
+// Detect webhook alert conditions
+long_limit_order_signal = should_place_long_order and na(pending_long_price[1]) and not long_limit_alert_sent
+short_limit_order_signal = should_place_short_order and na(pending_short_price[1]) and not short_limit_alert_sent
+
+// Detect order cancellations
+long_cancel_signal = not na(pending_long_price[1]) and na(pending_long_price) and strategy.position_size == 0 and not long_cancel_alert_sent
+short_cancel_signal = not na(pending_short_price[1]) and na(pending_short_price) and strategy.position_size == 0 and not short_cancel_alert_sent
+
+// Detect position closures
+long_position_closed = strategy.position_size == 0 and strategy.position_size[1] > 0
+short_position_closed = strategy.position_size == 0 and strategy.position_size[1] < 0
+
+// Detect EOD forced closure
+eod_forced_close = use_eod_close and current_time >= convertTimeToExchange(eod_close_time, timezone_offset_hours) and eod_close_triggered and strategy.position_size[1] != 0
+
+// Calculate alert message values (all rounded to nearest tick)
+long_limit_price = long_limit_order_signal ? optimal_long_entry : na
+long_stop_price = long_limit_order_signal ? math.round_to_mintick(optimal_long_entry - fixed_stop_points) : na  // Using fixed for webhooks
+long_target_price = long_limit_order_signal ? math.round_to_mintick(optimal_long_entry + target_points) : na
+
+short_limit_price = short_limit_order_signal ? optimal_short_entry : na
+short_stop_price = short_limit_order_signal ? math.round_to_mintick(optimal_short_entry + fixed_stop_points) : na  // Using fixed for webhooks
+short_target_price = short_limit_order_signal ? math.round_to_mintick(optimal_short_entry - target_points) : na
+
+// Update alert flags
+if long_limit_order_signal
+    long_limit_alert_sent := true
+    long_cancel_alert_sent := false
+
+if short_limit_order_signal
+    short_limit_alert_sent := true
+    short_cancel_alert_sent := false
+
+if long_cancel_signal
+    long_cancel_alert_sent := true
+    long_limit_alert_sent := false
+
+if short_cancel_signal
+    short_cancel_alert_sent := true
+    short_limit_alert_sent := false
+
+// Reset alert flags when no pending orders
+if na(pending_long_price) and na(pending_short_price) and strategy.position_size == 0
+    long_limit_alert_sent := false
+    short_limit_alert_sent := false
+    long_cancel_alert_sent := false
+    short_cancel_alert_sent := false
+
+// Strategy Webhook Alerts
+if long_limit_order_signal
+    if use_trailing_stop
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(long_limit_price) + ', "stop_loss": ' + str.tostring(long_stop_price) + ', "take_profit": ' + str.tostring(long_target_price) + ', "trailing_trigger": ' + str.tostring(trailing_trigger_points) + ', "trailing_offset": ' + str.tostring(trailing_offset_points) + ', "quantity": 1, "strategy": "OptimalEntry"}', alert.freq_once_per_bar)
+    else
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(long_limit_price) + ', "stop_loss": ' + str.tostring(long_stop_price) + ', "take_profit": ' + str.tostring(long_target_price) + ', "quantity": 1, "strategy": "OptimalEntry"}', alert.freq_once_per_bar)
+
+if short_limit_order_signal
+    if use_trailing_stop
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(short_limit_price) + ', "stop_loss": ' + str.tostring(short_stop_price) + ', "take_profit": ' + str.tostring(short_target_price) + ', "trailing_trigger": ' + str.tostring(trailing_trigger_points) + ', "trailing_offset": ' + str.tostring(trailing_offset_points) + ', "quantity": 1, "strategy": "OptimalEntry"}', alert.freq_once_per_bar)
+    else
+        alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "place_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(short_limit_price) + ', "stop_loss": ' + str.tostring(short_stop_price) + ', "take_profit": ' + str.tostring(short_target_price) + ', "quantity": 1, "strategy": "OptimalEntry"}', alert.freq_once_per_bar)
+
+if long_cancel_signal
+    cancel_reason = market_bias != previous_market_bias ? "bias_flip" : "expired"
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "cancel_limit", "side": "buy", "symbol": "' + syminfo.ticker + '", "reason": "' + cancel_reason + '", "quantity": 1, "strategy": "OptimalEntry"}', alert.freq_once_per_bar)
+
+if short_cancel_signal
+    cancel_reason = market_bias != previous_market_bias ? "bias_flip" : "expired"
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "cancel_limit", "side": "sell", "symbol": "' + syminfo.ticker + '", "reason": "' + cancel_reason + '", "quantity": 1, "strategy": "OptimalEntry"}', alert.freq_once_per_bar)
+
+// Position closed alerts
+if long_position_closed
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "position_closed", "side": "long", "symbol": "' + syminfo.ticker + '", "exit_price": ' + str.tostring(close) + ', "strategy": "OptimalEntry"}', alert.freq_once_per_bar)
+
+if short_position_closed
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "position_closed", "side": "short", "symbol": "' + syminfo.ticker + '", "exit_price": ' + str.tostring(close) + ', "strategy": "OptimalEntry"}', alert.freq_once_per_bar)
+
+// EOD forced close alert
+if eod_forced_close
+    eod_side = strategy.position_size[1] > 0 ? "long" : "short"
+    alert('{"webhook_type": "trade_signal", "secret": "' + webhook_secret + '", "action": "position_closed", "side": "' + eod_side + '", "symbol": "' + syminfo.ticker + '", "exit_price": ' + str.tostring(close) + ', "reason": "eod_close", "strategy": "OptimalEntry"}', alert.freq_once_per_bar)
+
+// Hidden plots for alert message values (for debugging)
+plot(long_limit_price, title="Long Limit Price", display=display.none)
+plot(long_stop_price, title="Long Stop Loss", display=display.none)
+plot(long_target_price, title="Long Take Profit", display=display.none)
+plot(short_limit_price, title="Short Limit Price", display=display.none)
+plot(short_stop_price, title="Short Stop Loss", display=display.none)
+plot(short_target_price, title="Short Take Profit", display=display.none)
+
+// ============================================================================
+// VISUALIZATION
+// ============================================================================
+
+// LT levels are already plotted by the indicator - no need to duplicate
+
+// Decision tree labels
+if show_decision_tree
+
+    // Phase 1 results
+    if market_bias != "NO_TRADE"
+        bias_text = "PHASE 1: " + market_bias + " BIAS\n" +
+                   "LDPS: " + (is_bullish_signal ? "BULL" : "BEAR") + "\n" +
+                   "LT Stack: " + str.tostring(market_bias == "LONG" ? lt_support_count : lt_resistance_count) + "/" + str.tostring(min_lt_stack) + "\n" +
+                   "Triggers: " + str.tostring(market_bias == "LONG" ? trigger_support_count : trigger_resistance_count) + "/" + str.tostring(min_trigger_levels)
+        label.new(bar_index, market_bias == "LONG" ? low - 15 : high + 15,
+                 text=bias_text, color=market_bias == "LONG" ? color.green : color.red,
+                 textcolor=color.white, style=market_bias == "LONG" ? label.style_label_up : label.style_label_down, size=size.small)
+
+    // Phase 2 results (if bias confirmed)
+    if market_bias != "NO_TRADE"
+        confluence_text = "PHASE 2: " + (all_confluence_met ? "✓" : "✗") + " CONFLUENCE\n" +
+                         "Vol: " + (volume_spike_met ? "✓" : "✗") + "\n" +
+                         "Prox: " + (proximity_met ? "✓" : "✗") + "\n" +
+                         "Session: " + (session_active ? "✓" : "✗") + "\n" +
+                         "EOD: " + (new_trades_allowed ? "✓" : "✗")
+        label.new(bar_index, market_bias == "LONG" ? low - 25 : high + 25,
+                 text=confluence_text, color=all_confluence_met ? color.blue : color.orange,
+                 textcolor=color.white, style=market_bias == "LONG" ? label.style_label_up : label.style_label_down, size=size.tiny)
+
+    // Phase 3 results (entry signals)
+    if should_place_long_order
+        entry_text = "PHASE 3: LONG ORDER\n" + "Entry: " + str.tostring(optimal_long_entry) + "\n" + "@ Support + " + str.tostring(entry_buffer_points)
+        label.new(bar_index, low - 35, text=entry_text, color=color.lime, textcolor=color.white, style=label.style_label_up, size=size.normal)
+
+    if should_place_short_order
+        entry_text = "PHASE 3: SHORT ORDER\n" + "Entry: " + str.tostring(optimal_short_entry) + "\n" + "@ Resistance - " + str.tostring(entry_buffer_points)
+        label.new(bar_index, high + 35, text=entry_text, color=color.red, textcolor=color.white, style=label.style_label_down, size=size.normal)
+
+    // Show order cancellations when bias flips
+    if market_bias != previous_market_bias and strategy.position_size == 0 and show_decision_tree
+        if market_bias == "LONG" and not na(pending_short_price[1])
+            label.new(bar_index, high + 20, text="🚫 CANCELLED SHORT\nBias → LONG", color=color.orange, textcolor=color.white, style=label.style_label_down, size=size.small)
+        else if market_bias == "SHORT" and not na(pending_long_price[1])
+            label.new(bar_index, low - 20, text="🚫 CANCELLED LONG\nBias → SHORT", color=color.orange, textcolor=color.white, style=label.style_label_up, size=size.small)
+        else if market_bias == "NO_TRADE"
+            label.new(bar_index, close, text="🚫 CANCELLED ALL\nNo Trade Signal", color=color.gray, textcolor=color.white, style=label.style_label_center, size=size.small)
+
+// Mark optimal entry levels with plots to avoid bar index issues
+plot(not na(pending_long_price) ? pending_long_price : na, title="Pending Long Entry", color=color.lime, linewidth=2, style=plot.style_circles)
+plot(not na(pending_short_price) ? pending_short_price : na, title="Pending Short Entry", color=color.red, linewidth=2, style=plot.style_circles)
+
+// Entry/Exit markers
+plotshape(strategy.position_size > 0 and strategy.position_size[1] == 0, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.normal)
+plotshape(strategy.position_size < 0 and strategy.position_size[1] == 0, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.normal)
+plotshape(strategy.position_size == 0 and strategy.position_size[1] > 0, title="Long Exit", style=shape.xcross, location=location.abovebar, color=color.lime, size=size.small)
+plotshape(strategy.position_size == 0 and strategy.position_size[1] < 0, title="Short Exit", style=shape.xcross, location=location.belowbar, color=color.red, size=size.small)
+
+// ============================================================================
+// DATA WINDOW VALUES
+// ============================================================================
+
+plotchar(market_bias == "LONG" ? 1 : market_bias == "SHORT" ? -1 : 0, title="Market Bias", char=" ", location=location.top, display=display.data_window)
+plotchar(lt_support_count, title="LT Support Count", char=" ", location=location.top, display=display.data_window)
+plotchar(lt_resistance_count, title="LT Resistance Count", char=" ", location=location.top, display=display.data_window)
+plotchar(all_confluence_met ? 1 : 0, title="All Confluence Met", char=" ", location=location.top, display=display.data_window)
+plotchar(volume_spike_met ? 1 : 0, title="Volume Spike", char=" ", location=location.top, display=display.data_window)
+plotchar(proximity_met ? 1 : 0, title="Proximity Met", char=" ", location=location.top, display=display.data_window)
+plotchar(session_active ? 1 : 0, title="Session Active", char=" ", location=location.top, display=display.data_window)
+plotchar(nearest_support_lt, title="Nearest Support LT", char=" ", location=location.top, display=display.data_window)
+plotchar(nearest_resistance_lt < 99999 ? nearest_resistance_lt : na, title="Nearest Resistance LT", char=" ", location=location.top, display=display.data_window)
+
+// Trigger Level debug info
+plotchar(trigger_support_count, title="Trigger Support Count", char=" ", location=location.top, display=display.data_window)
+plotchar(trigger_resistance_count, title="Trigger Resistance Count", char=" ", location=location.top, display=display.data_window)
+plotchar(trigger_long_met ? 1 : 0, title="Trigger Long Met", char=" ", location=location.top, display=display.data_window)
+plotchar(trigger_short_met ? 1 : 0, title="Trigger Short Met", char=" ", location=location.top, display=display.data_window)
+plotchar(optimal_long_entry, title="Optimal Long Entry", char=" ", location=location.top, display=display.data_window)
+plotchar(optimal_short_entry, title="Optimal Short Entry", char=" ", location=location.top, display=display.data_window)
+plotchar(not na(pending_long_price) ? 1 : 0, title="Pending Long Order Active", char=" ", location=location.top, display=display.data_window)
+plotchar(not na(pending_short_price) ? 1 : 0, title="Pending Short Order Active", char=" ", location=location.top, display=display.data_window)
+plotchar(previous_market_bias == "LONG" ? 1 : previous_market_bias == "SHORT" ? -1 : 0, title="Previous Market Bias", char=" ", location=location.top, display=display.data_window)
+
+// Webhook alert debug info
+plotchar(long_limit_order_signal ? 1 : 0, title="Long Limit Alert Sent", char=" ", location=location.top, display=display.data_window)
+plotchar(short_limit_order_signal ? 1 : 0, title="Short Limit Alert Sent", char=" ", location=location.top, display=display.data_window)
+plotchar(long_cancel_signal ? 1 : 0, title="Long Cancel Alert Sent", char=" ", location=location.top, display=display.data_window)
+plotchar(short_cancel_signal ? 1 : 0, title="Short Cancel Alert Sent", char=" ", location=location.top, display=display.data_window)
+plotchar(long_position_closed ? 1 : 0, title="Long Position Closed Alert", char=" ", location=location.top, display=display.data_window)
+plotchar(short_position_closed ? 1 : 0, title="Short Position Closed Alert", char=" ", location=location.top, display=display.data_window)
+
+// EOD debug info
+plotchar(current_time, title="Current Bar Open Time (HHMM)", char=" ", location=location.top, display=display.data_window)
+plotchar(use_eod_close ? bar_close_time : na, title="Current Bar Close Time (HHMM)", char=" ", location=location.top, display=display.data_window)
+plotchar(eod_close_time, title="EOD Close Time (Local)", char=" ", location=location.top, display=display.data_window)
+plotchar(eod_stop_new_trades_time, title="EOD Stop New Trades (Local)", char=" ", location=location.top, display=display.data_window)
+plotchar(use_eod_close ? convertTimeToExchange(eod_close_time, timezone_offset_hours) : na, title="EOD Close Time (Exchange)", char=" ", location=location.top, display=display.data_window)
+plotchar(use_eod_close ? convertTimeToExchange(eod_stop_new_trades_time, timezone_offset_hours) : na, title="EOD Stop Trades (Exchange)", char=" ", location=location.top, display=display.data_window)
+plotchar(timezone_offset_hours, title="Timezone Offset Hours", char=" ", location=location.top, display=display.data_window)
+plotchar(new_trades_allowed ? 1 : 0, title="New Trades Allowed", char=" ", location=location.top, display=display.data_window)
+plotchar(eod_close_triggered ? 1 : 0, title="EOD Close Triggered", char=" ", location=location.top, display=display.data_window)
+plotchar(is_past_eod_close ? 1 : 0, title="Is Past EOD Close Time", char=" ", location=location.top, display=display.data_window)
+plotchar(eod_close_attempt_count, title="EOD Close Attempts", char=" ", location=location.top, display=display.data_window)
+plotchar(strategy.position_size, title="Current Position Size", char=" ", location=location.top, display=display.data_window)
+
+// Debug stop values - critical for verifying exit logic
+var float debug_stop_ticks_long = na
+var float debug_stop_ticks_short = na
+if strategy.position_size > 0 and strategy.position_size[1] == 0
+    debug_stop_ticks_long := use_stop_loss ? (stop_loss_type == "Fixed Points" ? fixed_stop_points * 4 : (entry_price - (nearest_support_lt - dynamic_stop_buffer)) * 4) : na
+if strategy.position_size < 0 and strategy.position_size[1] == 0
+    debug_stop_ticks_short := use_stop_loss ? (stop_loss_type == "Fixed Points" ? fixed_stop_points * 4 : ((nearest_resistance_lt + dynamic_stop_buffer) - entry_price) * 4) : na
+plotchar(debug_stop_ticks_long, title="Stop Ticks Long (Debug)", char=" ", location=location.top, display=display.data_window)
+plotchar(debug_stop_ticks_short, title="Stop Ticks Short (Debug)", char=" ", location=location.top, display=display.data_window)
+plotchar(trailing_trigger_ticks, title="Trailing Trigger Ticks", char=" ", location=location.top, display=display.data_window)
+plotchar(trailing_offset_ticks, title="Trailing Offset Ticks", char=" ", location=location.top, display=display.data_window)
+
+// Debug output for stop type used
+plotchar(stop_type_used_long == "Fixed" ? 1 : stop_type_used_long == "Dynamic-LT" ? 2 : stop_type_used_long == "Dynamic-Fallback" ? 3 : 0, title="Long Stop Type (1=Fixed,2=LT,3=Fallback)", char=" ", location=location.top, display=display.data_window)
+plotchar(stop_type_used_short == "Fixed" ? 1 : stop_type_used_short == "Dynamic-LT" ? 2 : stop_type_used_short == "Dynamic-Fallback" ? 3 : 0, title="Short Stop Type (1=Fixed,2=LT,3=Fallback)", char=" ", location=location.top, display=display.data_window)
+plotchar(max_stop_loss_points * 4, title="Max Stop Ticks Cap", char=" ", location=location.top, display=display.data_window)
