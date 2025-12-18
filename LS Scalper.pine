@@ -12,9 +12,34 @@ strategy("LDPS Scalper", overlay=true)
 ldps_is_bullish = input.source(title="LDPS Is Bullish", defval=close, group="LDPS Settings")
 ldps_is_bearish = input.source(title="LDPS Is Bearish", defval=close, group="LDPS Settings")
 
+// LT (Liquidity Trigger) Level Settings
+lt_1 = input.source(title="LT Level 1", defval=close, group="LT Settings")
+lt_2 = input.source(title="LT Level 2", defval=close, group="LT Settings")
+lt_3 = input.source(title="LT Level 3", defval=close, group="LT Settings")
+min_bullish_lt = input.int(title="Minimum Bullish LT Levels Required", defval=0, minval=0, maxval=3, group="LT Settings", tooltip="Number of LT levels that must be below current price (acting as support)")
+min_bearish_lt = input.int(title="Minimum Bearish LT Levels Required", defval=0, minval=0, maxval=3, group="LT Settings", tooltip="Number of LT levels that must be above current price (acting as resistance)")
+
+// Position Type Controls
+allow_long = input.bool(true, title="Allow Long Trades", group="Position Control")
+allow_short = input.bool(true, title="Allow Short Trades", group="Position Control")
+
+// Trend Filter Settings
+use_trend_filter = input.bool(false, title="Use Trend Filter", group="Trend Filter", tooltip="Only take trades in direction of overall trend")
+trend_direction = input.source(title="Trend Direction", defval=close, group="Trend Filter", tooltip="1 = Bullish, 0 = Bearish from Trend Duration Forecast indicator")
+
+// Short Filters (improve short trade selection)
+use_volume_filter = input.bool(false, title="Enable Volume Filter", group="Short Filters", tooltip="Require minimum volume for short entries")
+volume_multiplier = input.float(1.5, title="Volume Multiplier", minval=1.0, maxval=5.0, step=0.1, group="Short Filters", tooltip="Minimum volume as multiple of average (e.g., 1.5 = 50% above average)")
+volume_period = input.int(20, title="Volume Lookback Period", minval=5, maxval=100, group="Short Filters", tooltip="Bars to calculate average volume")
+
+use_resistance_filter = input.bool(false, title="Enable Resistance Proximity Filter", group="Short Filters", tooltip="Only allow shorts near recent resistance levels")
+resistance_lookback = input.int(20, title="Resistance Lookback Period", minval=5, maxval=100, group="Short Filters", tooltip="Bars to look back for swing highs")
+resistance_proximity = input.float(5.0, title="Resistance Proximity (Points)", minval=1.0, maxval=50.0, step=0.5, group="Short Filters", tooltip="Max distance from recent high to allow short")
+
 // Scalp Target Settings
 take_profit_points = input.int(title="Take Profit (Points)", defval=8, minval=1, maxval=50, group="Scalp Settings")
 stop_loss_points = input.int(title="Stop Loss (Points)", defval=6, minval=1, maxval=50, group="Scalp Settings")
+use_dynamic_stop = input.bool(false, title="Use Dynamic Stop Loss", group="Scalp Settings", tooltip="Use signal bar high/low as stop instead of fixed points")
 
 // Trailing Stop Settings
 use_trailing_stop = input.bool(false, title="Enable Trailing Stop", group="Trailing Stop")
@@ -32,9 +57,71 @@ webhook_secret = input.string(title="Webhook Secret", defval="", group="Webhook 
 is_bullish = ldps_is_bullish > 0
 is_bearish = ldps_is_bearish > 0
 
+// Convert trend direction to boolean (1 = bullish, 0 = bearish)
+is_trend_bullish = trend_direction > 0.5
+
 // Detect LDPS flips - simpler logic: just went from not-bullish to bullish (or vice versa)
 ldps_flipped_bullish = is_bullish and not is_bullish[1]
 ldps_flipped_bearish = is_bearish and not is_bearish[1]
+
+// ============================================================================
+// LT LEVEL ANALYSIS
+// ============================================================================
+
+// Store LT levels in array for easier processing
+lt_levels = array.new<float>()
+array.push(lt_levels, lt_1)
+array.push(lt_levels, lt_2)
+array.push(lt_levels, lt_3)
+
+// Count bullish LT levels (those below current price acting as support)
+bullish_lt_count = 0
+for i = 0 to array.size(lt_levels) - 1
+    level = array.get(lt_levels, i)
+    if not na(level) and level < close
+        bullish_lt_count += 1
+
+// Count bearish LT levels (those above current price acting as resistance)
+bearish_lt_count = 0
+for i = 0 to array.size(lt_levels) - 1
+    level = array.get(lt_levels, i)
+    if not na(level) and level > close
+        bearish_lt_count += 1
+
+// Check if LT requirements are met
+bullish_lt_requirement_met = bullish_lt_count >= min_bullish_lt
+bearish_lt_requirement_met = bearish_lt_count >= min_bearish_lt
+
+// Apply trend filter to LDPS signals
+trend_filtered_bullish_flip = ldps_flipped_bullish and (not use_trend_filter or is_trend_bullish)
+trend_filtered_bearish_flip = ldps_flipped_bearish and (not use_trend_filter or not is_trend_bullish)
+
+// Apply position type controls
+position_filtered_bullish_signal = trend_filtered_bullish_flip and allow_long
+position_filtered_bearish_signal = trend_filtered_bearish_flip and allow_short
+
+// Apply LT level requirements
+lt_filtered_bullish_signal = position_filtered_bullish_signal and bullish_lt_requirement_met
+lt_filtered_bearish_signal = position_filtered_bearish_signal and bearish_lt_requirement_met
+
+// ============================================================================
+// SHORT FILTERS (improve short trade selection)
+// ============================================================================
+
+// Volume filter - check if current volume meets minimum threshold
+avg_volume = ta.sma(volume, volume_period)
+volume_threshold_met = volume >= (avg_volume * volume_multiplier)
+volume_filtered_bearish_signal = lt_filtered_bearish_signal and (not use_volume_filter or volume_threshold_met)
+
+// Resistance proximity filter - check if close to recent swing high
+highest_high = ta.highest(high, resistance_lookback)
+distance_from_high = highest_high - close
+near_resistance = distance_from_high <= resistance_proximity
+resistance_filtered_bearish_signal = volume_filtered_bearish_signal and (not use_resistance_filter or near_resistance)
+
+// Apply all filters
+final_bullish_signal = lt_filtered_bullish_signal  // Longs with LT requirements
+final_bearish_signal = resistance_filtered_bearish_signal  // Shorts with all filters
 
 // ============================================================================
 // STRATEGY EXECUTION
@@ -45,6 +132,10 @@ stop_ticks = stop_loss_points * 4
 target_ticks = take_profit_points * 4
 trailing_trigger_ticks = trailing_trigger_points * 4
 trailing_offset_ticks = trailing_offset_points * 4
+
+// Track dynamic stop levels
+var float dynamic_long_stop = na
+var float dynamic_short_stop = na
 
 // Track pending limit orders
 var int long_order_bar = na
@@ -76,34 +167,56 @@ short_cancelled := false
 is_flat = strategy.position_size == 0
 
 // Long entry on bullish flip - limit order at close
-if ldps_flipped_bullish and is_flat
+if final_bullish_signal and is_flat
     // Cancel any pending short order
     if not na(short_order_bar)
         strategy.cancel("Short")
         short_order_bar := na
         short_cancelled := true
 
+    // Set dynamic stop level for long position
+    dynamic_long_stop := low
+
     strategy.entry("Long", strategy.long, limit=close)
     long_order_bar := bar_index
-    if use_trailing_stop
-        strategy.exit("Exit Long", "Long", loss=stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+
+    // Use dynamic stop if enabled, otherwise use fixed points
+    if use_dynamic_stop
+        if use_trailing_stop
+            strategy.exit("Exit Long", "Long", stop=dynamic_long_stop, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+        else
+            strategy.exit("Exit Long", "Long", stop=dynamic_long_stop, profit=target_ticks)
     else
-        strategy.exit("Exit Long", "Long", loss=stop_ticks, profit=target_ticks)
+        if use_trailing_stop
+            strategy.exit("Exit Long", "Long", loss=stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+        else
+            strategy.exit("Exit Long", "Long", loss=stop_ticks, profit=target_ticks)
 
 // Short entry on bearish flip - limit order at close
-if ldps_flipped_bearish and is_flat
+if final_bearish_signal and is_flat
     // Cancel any pending long order
     if not na(long_order_bar)
         strategy.cancel("Long")
         long_order_bar := na
         long_cancelled := true
 
+    // Set dynamic stop level for short position
+    dynamic_short_stop := high
+
     strategy.entry("Short", strategy.short, limit=close)
     short_order_bar := bar_index
-    if use_trailing_stop
-        strategy.exit("Exit Short", "Short", loss=stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+
+    // Use dynamic stop if enabled, otherwise use fixed points
+    if use_dynamic_stop
+        if use_trailing_stop
+            strategy.exit("Exit Short", "Short", stop=dynamic_short_stop, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+        else
+            strategy.exit("Exit Short", "Short", stop=dynamic_short_stop, profit=target_ticks)
     else
-        strategy.exit("Exit Short", "Short", loss=stop_ticks, profit=target_ticks)
+        if use_trailing_stop
+            strategy.exit("Exit Short", "Short", loss=stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+        else
+            strategy.exit("Exit Short", "Short", loss=stop_ticks, profit=target_ticks)
 
 // Track expiration cancellations
 var bool long_expired = false
@@ -116,8 +229,18 @@ short_expired := not na(short_order_bar[1]) and na(short_order_bar) and strategy
 // ============================================================================
 
 // Show limit order placements
-plotshape(ldps_flipped_bullish, title="Long Limit Placed", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="L")
-plotshape(ldps_flipped_bearish, title="Short Limit Placed", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="S")
+plotshape(final_bullish_signal, title="Long Limit Placed", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="L")
+plotshape(final_bearish_signal, title="Short Limit Placed", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="S")
+
+// Show filtered signals
+plotshape(ldps_flipped_bullish and not trend_filtered_bullish_flip, title="Long Filtered by Trend", style=shape.triangleup, location=location.belowbar, color=color.gray, size=size.tiny, text="Tf")
+plotshape(ldps_flipped_bearish and not trend_filtered_bearish_flip, title="Short Filtered by Trend", style=shape.triangledown, location=location.abovebar, color=color.gray, size=size.tiny, text="Tf")
+plotshape(position_filtered_bullish_signal and not lt_filtered_bullish_signal, title="Long Filtered by LT Levels", style=shape.triangleup, location=location.belowbar, color=color.blue, size=size.tiny, text="LTf")
+plotshape(position_filtered_bearish_signal and not lt_filtered_bearish_signal, title="Short Filtered by LT Levels", style=shape.triangledown, location=location.abovebar, color=color.blue, size=size.tiny, text="LTf")
+plotshape(trend_filtered_bullish_flip and not position_filtered_bullish_signal, title="Long Disabled", style=shape.triangleup, location=location.belowbar, color=color.yellow, size=size.tiny, text="Ld")
+plotshape(lt_filtered_bearish_signal and not volume_filtered_bearish_signal, title="Short Filtered by Volume", style=shape.triangledown, location=location.abovebar, color=color.purple, size=size.tiny, text="Vf")
+plotshape(volume_filtered_bearish_signal and not resistance_filtered_bearish_signal, title="Short Filtered by Resistance", style=shape.triangledown, location=location.abovebar, color=color.orange, size=size.tiny, text="Rf")
+plotshape(trend_filtered_bearish_flip and not position_filtered_bearish_signal, title="Short Disabled", style=shape.triangledown, location=location.abovebar, color=color.yellow, size=size.tiny, text="Sd")
 
 // Show cancellations (due to opposite signal)
 plotshape(long_cancelled, title="Long Cancelled (Flip)", style=shape.xcross, location=location.belowbar, color=color.orange, size=size.small, text="Lx")
@@ -133,22 +256,31 @@ plotshape(short_expired, title="Short Expired", style=shape.xcross, location=loc
 
 plotchar(is_bullish ? 1 : 0, title="LDPS Bullish", char=" ", location=location.top, display=display.data_window)
 plotchar(is_bearish ? 1 : 0, title="LDPS Bearish", char=" ", location=location.top, display=display.data_window)
+plotchar(is_trend_bullish ? 1 : 0, title="Trend Bullish", char=" ", location=location.top, display=display.data_window)
+plotchar(bullish_lt_count, title="Bullish LT Count", char=" ", location=location.top, display=display.data_window)
+plotchar(bearish_lt_count, title="Bearish LT Count", char=" ", location=location.top, display=display.data_window)
+plotchar(min_bullish_lt, title="Min Bullish LT Required", char=" ", location=location.top, display=display.data_window)
+plotchar(min_bearish_lt, title="Min Bearish LT Required", char=" ", location=location.top, display=display.data_window)
+plotchar(bullish_lt_requirement_met ? 1 : 0, title="Bullish LT Requirement Met", char=" ", location=location.top, display=display.data_window)
+plotchar(bearish_lt_requirement_met ? 1 : 0, title="Bearish LT Requirement Met", char=" ", location=location.top, display=display.data_window)
+plotchar(volume_threshold_met ? 1 : 0, title="Volume Threshold Met", char=" ", location=location.top, display=display.data_window)
+plotchar(near_resistance ? 1 : 0, title="Near Resistance", char=" ", location=location.top, display=display.data_window)
 
 // ============================================================================
 // ALERTS
 // ============================================================================
 
 // Track alert conditions
-long_limit_placed = ldps_flipped_bullish and is_flat
-short_limit_placed = ldps_flipped_bearish and is_flat
+long_limit_placed = final_bullish_signal and is_flat
+short_limit_placed = final_bearish_signal and is_flat
 
 // Calculate prices for alerts
 long_limit_price = close
-long_stop_price = close - stop_loss_points
+long_stop_price = use_dynamic_stop ? dynamic_long_stop : close - stop_loss_points
 long_target_price = close + take_profit_points
 
 short_limit_price = close
-short_stop_price = close + stop_loss_points
+short_stop_price = use_dynamic_stop ? dynamic_short_stop : close + stop_loss_points
 short_target_price = close - take_profit_points
 
 // Cancel signals

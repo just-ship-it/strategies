@@ -26,6 +26,15 @@ min_bearish_ldpm = input.int(title="Minimum Bearish LDPM Levels Required", defva
 allow_long = input.bool(title="Allow Long Positions", defval=true, group="Position Settings")
 allow_short = input.bool(title="Allow Short Positions", defval=true, group="Position Settings")
 
+// Volume Filters (improve trade selection)
+use_long_volume_filter = input.bool(false, title="Enable Volume Filter for Longs", group="Volume Filters", tooltip="Require minimum volume for long entries")
+long_volume_multiplier = input.float(1.2, title="Long Volume Multiplier", minval=1.0, maxval=5.0, step=0.1, group="Volume Filters", tooltip="Minimum volume as multiple of average")
+
+use_short_volume_filter = input.bool(false, title="Enable Volume Filter for Shorts", group="Volume Filters", tooltip="Require minimum volume for short entries")
+short_volume_multiplier = input.float(1.2, title="Short Volume Multiplier", minval=1.0, maxval=5.0, step=0.1, group="Volume Filters", tooltip="Minimum volume as multiple of average")
+
+volume_period = input.int(48, title="Volume Lookback Period", minval=5, maxval=100, group="Volume Filters", tooltip="Bars to calculate average volume (shared for both long and short)")
+
 // LDPM Crossing Filter Settings
 use_ldpm_filter = input.bool(true, title="Enable LDPM Crossing Filter", group="LDPM Filter")
 max_ldpm_crossed = input.int(0, title="Max LDPM Levels Crossed by Trigger", minval=0, maxval=5, group="LDPM Filter", tooltip="Maximum number of LDPM levels the trigger candle can cross. 0 = trigger candle must not touch any LDPM levels")
@@ -75,11 +84,13 @@ ldps_flipped_bearish = is_bearish and is_bullish[1] and not is_bearish[1]
 var float trigger_candle_low = na
 var int trigger_bar_index = na
 var int bars_since_trigger = 0
+var string trigger_signal_time_str = na
 
 // Track short trigger candle information
 var float short_trigger_candle_high = na
 var int short_trigger_bar_index = na
 var int bars_since_short_trigger = 0
+var string short_trigger_signal_time_str = na
 
 // Track entry information for second tier trailing
 var int entry_bar_index = na
@@ -154,11 +165,17 @@ if opposite_bars_required > 0
             opposite_bars_met := false
             break
 
+// Volume filter for longs - check if current volume meets minimum threshold
+avg_volume = ta.sma(volume, volume_period)
+long_volume_threshold_met = volume >= (avg_volume * long_volume_multiplier)
+long_volume_filter_passed = not use_long_volume_filter or long_volume_threshold_met
+
 // When LDPS flips bullish and all requirements are met, store trigger candle info
-if ldps_flipped_bullish and ldpm_requirement_met and ldpm_filter_passed and strategy.position_size == 0 and allow_long and opposite_bars_met
+if ldps_flipped_bullish and ldpm_requirement_met and ldpm_filter_passed and strategy.position_size == 0 and allow_long and opposite_bars_met and long_volume_filter_passed
     // Only store new trigger if no existing pending trigger
     if na(trigger_candle_low)
         trigger_candle_low := math.min(open, close)  // Base of candle body
+        trigger_signal_time_str := str.format_time(time, "yyyy-MM-dd HH:mm", "America/New_York")
         trigger_bar_index := bar_index
         bars_since_trigger := 0
         long_limit_alert_sent := false  // Reset alert flag for new signal
@@ -199,11 +216,16 @@ if opposite_bars_required > 0
             opposite_bars_met_short := false
             break
 
+// Volume filter for shorts - check if current volume meets minimum threshold (uses same avg_volume as longs)
+short_volume_threshold_met = volume >= (avg_volume * short_volume_multiplier)
+short_volume_filter_passed = not use_short_volume_filter or short_volume_threshold_met
+
 // When LDPS flips bearish and all requirements are met, store short trigger candle info
-if ldps_flipped_bearish and bearish_ldpm_requirement_met and bearish_ldpm_filter_passed and strategy.position_size == 0 and allow_short and opposite_bars_met_short
+if ldps_flipped_bearish and bearish_ldpm_requirement_met and bearish_ldpm_filter_passed and strategy.position_size == 0 and allow_short and opposite_bars_met_short and short_volume_filter_passed
     // Only store new trigger if no existing pending trigger
     if na(short_trigger_candle_high)
         short_trigger_candle_high := math.max(open, close)  // Top of candle body
+        short_trigger_signal_time_str := str.format_time(time, "yyyy-MM-dd HH:mm", "America/New_York")
         short_trigger_bar_index := bar_index
         bars_since_short_trigger := 0
         short_limit_alert_sent := false  // Reset alert flag for new signal
@@ -222,9 +244,9 @@ bullish_flip_cancel = ldps_flipped_bullish and strategy.position_size == 0
 // ============================================================================
 
 // Calculate alert trigger conditions
-long_limit_order_signal = ldps_flipped_bullish and ldpm_requirement_met and ldpm_filter_passed and strategy.position_size == 0 and allow_long and opposite_bars_met and na(trigger_candle_low[1])
+long_limit_order_signal = ldps_flipped_bullish and ldpm_requirement_met and ldpm_filter_passed and strategy.position_size == 0 and allow_long and opposite_bars_met and long_volume_filter_passed and na(trigger_candle_low[1])
 
-short_limit_order_signal = ldps_flipped_bearish and bearish_ldpm_requirement_met and bearish_ldpm_filter_passed and strategy.position_size == 0 and allow_short and opposite_bars_met_short and na(short_trigger_candle_high[1])
+short_limit_order_signal = ldps_flipped_bearish and bearish_ldpm_requirement_met and bearish_ldpm_filter_passed and strategy.position_size == 0 and allow_short and opposite_bars_met_short and short_volume_filter_passed and na(short_trigger_candle_high[1])
 
 long_cancel_signal = not na(trigger_candle_low) and strategy.position_size == 0 and (bars_exceeded or bearish_flip_cancel) and not long_cancel_alert_sent
 
@@ -271,6 +293,7 @@ if not na(trigger_candle_low) and strategy.position_size == 0 and (bars_exceeded
     trigger_candle_low := na
     trigger_bar_index := na
     bars_since_trigger := 0
+    trigger_signal_time_str := na
 
 // Reset short trigger and cancel pending orders if conditions are met (but NOT if position is already filled)
 if not na(short_trigger_candle_high) and strategy.position_size == 0 and (short_bars_exceeded or bullish_flip_cancel)
@@ -278,12 +301,13 @@ if not na(short_trigger_candle_high) and strategy.position_size == 0 and (short_
     short_trigger_candle_high := na
     short_trigger_bar_index := na
     bars_since_short_trigger := 0
+    short_trigger_signal_time_str := na
 
 // Long entry condition: Use stored trigger candle low as entry point with filter check
-long_condition = not na(trigger_candle_low) and strategy.position_size == 0 and ldpm_requirement_met and ldpm_filter_passed
+long_condition = not na(trigger_candle_low) and strategy.position_size == 0 and ldpm_requirement_met and ldpm_filter_passed and long_volume_filter_passed
 
 // Short entry condition: Use stored trigger candle high as entry point with filter check
-short_condition = not na(short_trigger_candle_high) and strategy.position_size == 0 and bearish_ldpm_requirement_met and bearish_ldpm_filter_passed
+short_condition = not na(short_trigger_candle_high) and strategy.position_size == 0 and bearish_ldpm_requirement_met and bearish_ldpm_filter_passed and short_volume_filter_passed
 
 // ============================================================================
 // STRATEGY EXECUTION
@@ -295,11 +319,29 @@ target_ticks = take_profit_points * 4
 
 // Long entry at trigger candle base using limit order
 if long_condition
-    strategy.entry("Long", strategy.long, limit=trigger_candle_low)
+    strategy.entry("Long", strategy.long, limit=trigger_candle_low, comment=trigger_signal_time_str)
+
+    // Set up exit orders immediately when entry is placed
+    // This ensures exits are defined on the same bar as entry
+    if use_trailing_stop
+        trailing_trigger_ticks = trailing_trigger_points * 4
+        trailing_offset_ticks = trailing_offset_points * 4
+        strategy.exit("Long Exit", "Long", loss=stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else
+        strategy.exit("Long Exit", "Long", loss=stop_ticks, profit=target_ticks)
 
 // Short entry at trigger candle top using limit order
 if short_condition
-    strategy.entry("Short", strategy.short, limit=short_trigger_candle_high)
+    strategy.entry("Short", strategy.short, limit=short_trigger_candle_high, comment=short_trigger_signal_time_str)
+
+    // Set up exit orders immediately when entry is placed
+    // This ensures exits are defined on the same bar as entry
+    if use_trailing_stop
+        trailing_trigger_ticks = trailing_trigger_points * 4
+        trailing_offset_ticks = trailing_offset_points * 4
+        strategy.exit("Short Exit", "Short", loss=stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
+    else
+        strategy.exit("Short Exit", "Short", loss=stop_ticks, profit=target_ticks)
 
 // Track when new position is filled
 if strategy.position_size > 0 and strategy.position_size[1] == 0
@@ -310,6 +352,7 @@ if strategy.position_size > 0 and strategy.position_size[1] == 0
         trigger_candle_low := na
         trigger_bar_index := na
         bars_since_trigger := 0
+        trigger_signal_time_str := na
 
 if strategy.position_size < 0 and strategy.position_size[1] == 0
     entry_bar_index := bar_index
@@ -319,6 +362,7 @@ if strategy.position_size < 0 and strategy.position_size[1] == 0
         short_trigger_candle_high := na
         short_trigger_bar_index := na
         bars_since_short_trigger := 0
+        short_trigger_signal_time_str := na
 
 // Standard exit with optional trailing stop and break-even
 if strategy.position_size > 0 and not second_tier_active
@@ -331,21 +375,14 @@ if strategy.position_size > 0 and not second_tier_active
 
     // Apply appropriate exit strategy
     if breakeven_active
-        // Use break-even as stop price
+        // Use break-even as stop price (updates the initial exit)
         if use_trailing_stop
             trailing_trigger_ticks = trailing_trigger_points * 4
             trailing_offset_ticks = trailing_offset_points * 4
             strategy.exit("Long Exit", "Long", stop=breakeven_stop_price, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
         else
             strategy.exit("Long Exit", "Long", stop=breakeven_stop_price, profit=target_ticks)
-    else
-        // Standard exits without break-even
-        if use_trailing_stop
-            trailing_trigger_ticks = trailing_trigger_points * 4
-            trailing_offset_ticks = trailing_offset_points * 4
-            strategy.exit("Long Exit", "Long", loss=stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
-        else
-            strategy.exit("Long Exit", "Long", loss=stop_ticks, profit=target_ticks)
+    // Note: Standard exits are already set on entry, no need to re-apply them here
 
 // Check for second tier trailing activation
 if use_second_tier_trailing and strategy.position_size > 0 and not na(entry_bar_index)
@@ -372,21 +409,14 @@ if strategy.position_size < 0 and not second_tier_active
 
     // Apply appropriate exit strategy for shorts
     if breakeven_active
-        // Use break-even as stop price for shorts
+        // Use break-even as stop price for shorts (updates the initial exit)
         if use_trailing_stop
             trailing_trigger_ticks = trailing_trigger_points * 4
             trailing_offset_ticks = trailing_offset_points * 4
             strategy.exit("Short Exit", "Short", stop=breakeven_stop_price, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
         else
             strategy.exit("Short Exit", "Short", stop=breakeven_stop_price, profit=target_ticks)
-    else
-        // Standard exits without break-even for shorts
-        if use_trailing_stop
-            trailing_trigger_ticks = trailing_trigger_points * 4
-            trailing_offset_ticks = trailing_offset_points * 4
-            strategy.exit("Short Exit", "Short", loss=stop_ticks, profit=target_ticks, trail_points=trailing_trigger_ticks, trail_offset=trailing_offset_ticks)
-        else
-            strategy.exit("Short Exit", "Short", loss=stop_ticks, profit=target_ticks)
+    // Note: Standard exits are already set on entry, no need to re-apply them here
 
 // Check for second tier trailing activation for shorts
 if use_second_tier_trailing and strategy.position_size < 0 and not na(entry_bar_index)
@@ -422,9 +452,10 @@ if show_debug_labels and ldps_flipped_bullish
                  "\nLDPM Crossed: " + str.tostring(ldpm_crossed_count) +
                  "\nMax Allowed: " + str.tostring(max_ldpm_crossed) +
                  "\nFilter: " + (ldpm_filter_passed ? "PASS" : "FAIL") +
-                 "\nOpposite Bars: " + (opposite_bars_met ? "PASS" : "FAIL")
+                 "\nOpposite Bars: " + (opposite_bars_met ? "PASS" : "FAIL") +
+                 (use_long_volume_filter ? "\nVolume Filter: " + (long_volume_filter_passed ? "PASS" : "FAIL") : "")
 
-    label_color = ldpm_requirement_met and ldpm_filter_passed and opposite_bars_met ? color.green : color.orange
+    label_color = ldpm_requirement_met and ldpm_filter_passed and opposite_bars_met and long_volume_filter_passed ? color.green : color.orange
     label.new(bar_index, high + 5, text=label_text, color=label_color, textcolor=color.white, style=label.style_label_down, size=size.small)
 
 // Mark LDPS bearish flip events
@@ -435,9 +466,10 @@ if show_debug_labels and ldps_flipped_bearish
                  "\nLDPM Crossed: " + str.tostring(bearish_ldpm_crossed_count) +
                  "\nMax Allowed: " + str.tostring(max_ldpm_crossed) +
                  "\nFilter: " + (bearish_ldpm_filter_passed ? "PASS" : "FAIL") +
-                 "\nOpposite Bars: " + (opposite_bars_met_short ? "PASS" : "FAIL")
+                 "\nOpposite Bars: " + (opposite_bars_met_short ? "PASS" : "FAIL") +
+                 (use_short_volume_filter ? "\nVolume Filter: " + (short_volume_filter_passed ? "PASS" : "FAIL") : "")
 
-    label_color = bearish_ldpm_requirement_met and bearish_ldpm_filter_passed and opposite_bars_met_short ? color.red : color.orange
+    label_color = bearish_ldpm_requirement_met and bearish_ldpm_filter_passed and opposite_bars_met_short and short_volume_filter_passed ? color.red : color.orange
     label.new(bar_index, low - 5, text=label_text, color=label_color, textcolor=color.white, style=label.style_label_up, size=size.small)
 
 // Mark long trigger candle base
@@ -508,6 +540,8 @@ plotchar(bearish_ldpm_crossed_count, title="Bearish LDPM Levels Crossed", char="
 plotchar(bearish_ldpm_filter_passed ? 1 : 0, title="Bearish LDPM Filter Passed", char=" ", location=location.top, display=display.data_window)
 plotchar(allow_long ? 1 : 0, title="Allow Long Positions", char=" ", location=location.top, display=display.data_window)
 plotchar(allow_short ? 1 : 0, title="Allow Short Positions", char=" ", location=location.top, display=display.data_window)
+plotchar(long_volume_threshold_met ? 1 : 0, title="Long Volume Threshold Met", char=" ", location=location.top, display=display.data_window)
+plotchar(short_volume_threshold_met ? 1 : 0, title="Short Volume Threshold Met", char=" ", location=location.top, display=display.data_window)
 plotchar(opposite_bars_required, title="Opposite Bars Required", char=" ", location=location.top, display=display.data_window)
 plotchar(use_breakeven_stop ? 1 : 0, title="Break-Even Stop Enabled", char=" ", location=location.top, display=display.data_window)
 plotchar(breakeven_trigger_points, title="Break-Even Trigger Points", char=" ", location=location.top, display=display.data_window)

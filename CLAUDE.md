@@ -51,6 +51,9 @@ This is a TradingView Pine Script strategies repository containing automated tra
 4. Implement entry/exit logic
 5. Add risk management (stop loss, take profit, trailing stops)
 
+### Coding Standards
+- **No Line Continuations**: Always write Pine Script code on single lines without line continuations for better readability and consistency
+
 ### External Dependencies
 - Strategies expect external indicator inputs for LDPS and LDPM signals
 - Common library uses TradingView's built-in `ta` library: `import TradingView/ta/10`

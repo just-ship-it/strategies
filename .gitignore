@@ -9,3 +9,12 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
+
+# Data files
+data/
+
+# Python cache
+__pycache__/
+
+# External files
+external/
